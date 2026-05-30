@@ -43,8 +43,51 @@ LANGMAP_GLOBAL = {
 
 SYSTEM_LANG = ''
 SYSTEM_LANGMAP = {
-    'zh-CN': '简体中文'        
+    'zh-CN': '简体中文'
 }
+
+
+# Source languages whose comics are read right-to-left (manga / manhua).
+# When the source is one of these, a row of balloons is read right→left.
+RTL_SOURCE_LANGS = {'日本語', '简体中文', '繁體中文'}
+
+
+def reading_order_indices(blocks, rtl: bool) -> List[int]:
+    """Return indices into `blocks` ordered for human reading.
+
+    Blocks are banded into rows top-to-bottom by their vertical center
+    (band height = 0.7 × median block height, so it adapts to the page's
+    text size). Within a row, blocks are ordered right-to-left when `rtl`
+    (Japanese / Chinese comics) else left-to-right.
+
+    This is used to order the batched translation request so context-aware
+    engines (LLMs) read a panel's text in narrative sequence and keep names,
+    terms, and honorifics consistent. It does NOT reorder any caller-owned
+    list — callers map results back by index.
+
+    Any error (missing/odd geometry) falls back to the original order so a
+    layout quirk can never break translation.
+    """
+    n = len(blocks)
+    if n <= 1:
+        return list(range(n))
+    try:
+        def xyxy(b):
+            x = b.xyxy
+            return float(x[0]), float(x[1]), float(x[2]), float(x[3])
+
+        heights = sorted(max(1.0, xyxy(b)[3] - xyxy(b)[1]) for b in blocks)
+        band = max(10.0, heights[n // 2] * 0.7)
+
+        def key(i):
+            x1, y1, x2, y2 = xyxy(blocks[i])
+            cy = (y1 + y2) / 2
+            cx = (x1 + x2) / 2
+            return (int(cy // band), -cx if rtl else cx)
+
+        return sorted(range(n), key=key)
+    except Exception:
+        return list(range(n))
 
 
 def check_language_support(check_type: str = 'source'):
@@ -183,21 +226,37 @@ class BaseTranslator(BaseModule):
     def translate_textblk_lst(self, textblk_lst: List[TextBlock]):
         '''
         only textblks with non-empty source text would be passed to translator
-        '''
-        non_empty_ids = []
-        text_list = []
-        translations = []
-        for ii, blk in enumerate(textblk_lst):
-            text = blk.get_text()
-            if text.strip() != '':
-                non_empty_ids.append(ii)
-                text_list.append(text)
-            translations.append(text)
 
-        if len(text_list) > 0:
+        Non-empty blocks are batched into a single translate() call, ordered in
+        human reading order (top-to-bottom rows; right-to-left within a row for
+        Japanese/Chinese sources, left-to-right otherwise). This lets
+        context-aware engines (LLMs) see a panel's text in narrative sequence
+        and keep character names, terms, and honorifics consistent across the
+        batch. Results are mapped back to each block by its original index, so
+        the caller's `textblk_lst` order is never changed — only the order
+        inside the translation request.
+        '''
+        translations = [blk.get_text() for blk in textblk_lst]
+
+        # (original_index, source_text) for every non-empty block.
+        pending = [(ii, txt) for ii, txt in enumerate(translations)
+                   if txt.strip() != '']
+
+        if len(pending) > 0:
+            # Order the batch by reading order WITHOUT disturbing textblk_lst.
+            order = reading_order_indices(
+                [textblk_lst[ii] for ii, _ in pending],
+                rtl=self.lang_source in RTL_SOURCE_LANGS,
+            )
+            ordered = [pending[k] for k in order]
+            text_list = [txt for _, txt in ordered]
+
             _translations = self.translate(text_list)
-            for ii, idx in enumerate(non_empty_ids):
-                translations[idx] = _translations[ii]
+
+            # _translations is in the same order as text_list (== ordered),
+            # so zip aligns each result with its original block index.
+            for (orig_idx, _), tr in zip(ordered, _translations):
+                translations[orig_idx] = tr
 
         for callback_name, callback in self._postprocess_hooks.items():
             callback(translations = translations, textblocks = textblk_lst, translator = self)

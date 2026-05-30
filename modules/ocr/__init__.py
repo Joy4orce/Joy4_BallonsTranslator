@@ -156,6 +156,73 @@ class MangaOCR(OCRBase):
 
 
 
+@register_OCR('manga_ocr_2025')
+class MangaOCR2025(OCRBase):
+    """ONNX-based 2025-retrained manga-ocr (l0wgear/manga-ocr-2025-onnx).
+
+    Same per-balloon usage pattern as manga_ocr, but runs through ONNX
+    Runtime (CPU or CUDA) instead of PyTorch. ~3x smaller on disk (~141MB),
+    similar latency on CPU and faster on GPU.
+    """
+
+    params = {
+        'device': DEVICE_SELECTOR(),
+        'description': 'ONNX manga-ocr (2025 retrain, jzhang533/manga-ocr-base-2025 base)',
+    }
+    device = DEFAULT_DEVICE
+
+    download_file_list = [{
+        'url': 'https://huggingface.co/l0wgear/manga-ocr-2025-onnx/resolve/main/',
+        'files': [
+            'encoder_model.onnx',
+            'decoder_model.onnx',
+            'config.json',
+            'generation_config.json',
+            'tokenizer.json',
+            'vocab.txt',
+            'tokenizer_config.json',
+            'special_tokens_map.json',
+            'preprocessor_config.json',
+        ],
+        'sha256_pre_calculated': [None] * 9,
+        'save_dir': 'data/models/manga-ocr-2025-onnx',
+        'concatenate_url_filename': 1,
+    }]
+    _load_model_keys = {'model'}
+
+    def __init__(self, **params) -> None:
+        super().__init__(**params)
+        self.device = self.params['device']['select']
+        self.model = None
+
+    def _load_model(self):
+        from .manga_ocr import MangaOcr2025
+        self.model = MangaOcr2025(device=self.device)
+
+    def ocr_img(self, img: np.ndarray) -> str:
+        return self.model(img)
+
+    def _ocr_blk_list(self, img: np.ndarray, blk_list: List[TextBlock]):
+        im_h, im_w = img.shape[:2]
+        for blk in blk_list:
+            x1, y1, x2, y2 = blk.xyxy
+            if y2 < im_h and x2 < im_w and \
+                x1 > 0 and y1 > 0 and x1 < x2 and y1 < y2:
+                blk.text = self.model(img[y1:y2, x1:x2])
+            else:
+                logging.warning('invalid textbbox to target img')
+                blk.text = ['']
+
+    def updateParam(self, param_key: str, param_content):
+        super().updateParam(param_key, param_content)
+        device = self.params['device']['select']
+        if self.device != device:
+            self.device = device
+            if self.model is not None:
+                self.model.to(device)
+
+
+
 from .mit48px_ctc import OCR48pxCTC
 @register_OCR('mit48px_ctc')
 class OCRMIT48pxCTC(OCRBase):

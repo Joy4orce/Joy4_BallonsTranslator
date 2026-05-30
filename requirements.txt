@@ -8,6 +8,15 @@ jaconv
 torch
 torchvision
 transformers
+# `optimum` WITHOUT the [onnxruntime] extra — the extra pulls in the CPU
+# `onnxruntime` package which would clash with `onnxruntime-gpu` (same
+# import name, same site-packages dir). We install only the GPU build
+# below; it provides CPUExecutionProvider as a fallback too.
+optimum<2.0
+onnxruntime-gpu<1.18; sys_platform == 'win32'
+onnxruntime-gpu<1.18; sys_platform == 'linux'
+# Mac has no NVIDIA — install the CPU package there.
+onnxruntime; sys_platform == 'darwin'
 fugashi
 unidic_lite
 tqdm

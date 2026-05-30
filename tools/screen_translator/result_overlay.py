@@ -1,0 +1,445 @@
+"""Floating always-on-top overlay that draws translations at each detected
+balloon's bbox.
+
+Sized and positioned to match the captured screen region exactly, so block
+coordinates from the pipeline (which are in capture-image space) map 1:1 to
+overlay coordinates. Click or ESC dismisses; optional auto-timeout.
+"""
+
+from typing import List, Optional
+
+import numpy as np
+from qtpy.QtCore import Qt, QRect, QTimer, Signal
+from qtpy.QtGui import (
+    QPainter, QColor, QImage, QPen, QFont, QFontMetrics, QPalette, QPixmap
+)
+from qtpy.QtWidgets import QWidget
+
+from .pipeline import TranslatedBlock
+
+
+class ResultOverlay(QWidget):
+
+    closed = Signal()
+
+    # Padding inside each translation box (used by both layout & paint).
+    BOX_PADDING_X = 6
+    BOX_PADDING_Y = 4
+    # Smallest font we'll shrink to. Below this Korean glyphs are unreadable
+    # even on a high-DPI monitor. If shrinking to this minimum still doesn't
+    # fit, the box height grows as a last-resort fallback.
+    MIN_FONT_PT = 8
+    # Bitmask of QPainter::drawText flags used for both measurement and paint.
+    TEXT_FLAGS = int(Qt.AlignmentFlag.AlignTop
+                     | Qt.AlignmentFlag.AlignLeft
+                     | Qt.TextFlag.TextWordWrap)
+
+    def __init__(self, blocks: List[TranslatedBlock], capture_xywh: tuple,
+                 *, inpainted_img: Optional[np.ndarray] = None,
+                 auto_dismiss_ms: int = 0, box_opacity: float = 0.85,
+                 font_family: str = 'Malgun Gothic', font_size: int = 14):
+        super().__init__()
+        self.blocks = [b for b in blocks if b.translation.strip()]
+        self.box_opacity = box_opacity
+        self.font_family = font_family
+        self.max_font_pt = font_size
+        # `self.font` is the *configured* font, used for things outside the
+        # per-block boxes (the corner hint). Each block picks its own size.
+        self.font = QFont(font_family, font_size)
+        self.font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+
+        # Inpainted background: when present, the overlay paints this image
+        # at 1:1 over the captured region and renders translation text
+        # directly on top (no white boxes — the original text is already
+        # erased from the background). When None, falls back to translucent
+        # white boxes over the unmodified screen content.
+        self._background_pixmap = self._to_pixmap(inpainted_img) if inpainted_img is not None else None
+
+        # Frameless, always-on-top, transparent, no taskbar entry. Cursor
+        # stays normal so users can move their mouse off to the side; the
+        # whole widget swallows clicks to close.
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        # Only request a translucent background when we DON'T have an
+        # inpainted background. With the inpainted image, the whole overlay
+        # is opaque (the image fills it), and TranslucentBackground would
+        # cost an unnecessary compositing layer on top.
+        if self._background_pixmap is None:
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+
+        # Stash the original capture dimensions BEFORE layout — _compute_layout
+        # needs them as the soft upper bound for box expansion (boxes can grow
+        # to the edge of the captured region but not beyond, so we don't
+        # bleed outside the user's chosen area).
+        _, _, orig_cap_w, orig_cap_h = capture_xywh
+        self._orig_capture_size = (orig_cap_w, orig_cap_h)
+
+        # For each block, decide the largest font size that fits, expanding
+        # the box into whatever room is available between neighboring blocks.
+        # See _compute_layout's docstring for the full algorithm.
+        self._layout = self._compute_layout()
+
+        # Grow the overlay window itself if any expanded box extends below
+        # / beyond the captured region. Otherwise text past the widget's
+        # right or bottom edge would get clipped by the parent surface.
+        x, y, w, h = capture_xywh
+        if self._layout:
+            w = max(w, max(item['rect'][2] for item in self._layout))
+            h = max(h, max(item['rect'][3] for item in self._layout))
+
+        self._capture_xywh = (x, y, w, h)
+        self.setGeometry(x, y, w, h)
+
+        if auto_dismiss_ms > 0:
+            QTimer.singleShot(auto_dismiss_ms, self.close)
+
+    # ── Layout ──────────────────────────────────────────────────────────────
+
+    # Alignment for balloon-filled text: centered both ways + word wrap.
+    ALIGN_CENTER = int(Qt.AlignmentFlag.AlignHCenter
+                       | Qt.AlignmentFlag.AlignVCenter
+                       | Qt.TextFlag.TextWordWrap)
+
+    def _compute_layout(self):
+        """For each block, decide the font size, final box rect, and text
+        alignment.
+
+        Returns a list of dicts (one per block, same order as self.blocks):
+            {'rect': (x1, y1, x2, y2), 'font_pt': int, 'align': int}
+
+        Two layout modes:
+          - Balloon mode (block has balloon_xyxy): lay the translation out to
+            FILL the whole balloon, centered. This is the normal case once
+            balloon detection + inpaint are on, and it's what makes vertical-
+            Japanese balloons read correctly after translation to horizontal
+            Korean.
+          - Text-box mode (no balloon): the original behavior — start at the
+            text bbox, top-left aligned, and expand into free space.
+        """
+        out = []
+        for idx, blk in enumerate(self.blocks):
+            balloon = getattr(blk, 'balloon_xyxy', None)
+            if balloon is not None:
+                out.append(self._layout_in_balloon(blk, balloon))
+            else:
+                out.append(self._layout_in_textbox(idx, blk))
+        return out
+
+    def _layout_in_balloon(self, blk, balloon):
+        """Fit the translation inside the balloon box, centered. Picks the
+        largest font (max → MIN) whose wrapped text fits the balloon. If even
+        MIN_FONT_PT doesn't fit, keeps MIN and grows the box downward (rare —
+        balloons are large)."""
+        bx1, by1, bx2, by2 = [int(v) for v in balloon]
+        bw = max(1, bx2 - bx1)
+        bh = max(1, by2 - by1)
+
+        chosen_pt = self.MIN_FONT_PT
+        final_h = bh
+        for pt in range(self.max_font_pt, self.MIN_FONT_PT - 1, -1):
+            nw, nh = self._needed_size(blk.translation, pt, bw)
+            if nw <= bw and nh <= bh:
+                chosen_pt = pt
+                break
+        else:
+            # Doesn't fit even at the minimum font — grow height so nothing
+            # is clipped (widget will enlarge to fit in __init__).
+            _nw, nh = self._needed_size(blk.translation, self.MIN_FONT_PT, bw)
+            chosen_pt = self.MIN_FONT_PT
+            final_h = max(bh, nh)
+
+        return {
+            'rect': (bx1, by1, bx2, by1 + final_h),
+            'font_pt': chosen_pt,
+            'align': self.ALIGN_CENTER,
+        }
+
+    def _layout_in_textbox(self, idx, blk):
+        """Original text-bbox layout: top-left aligned, expand into free
+        space between neighbors. Used when no balloon was detected."""
+        x1, y1, x2, y2 = blk.xyxy
+        bw = max(1, x2 - x1)
+        bh = max(1, y2 - y1)
+
+        max_right, max_bottom = self._expansion_bounds(idx)
+        max_w = max(bw, max_right - x1)
+        max_h = max(bh, max_bottom - y1)
+
+        chosen_pt = self.MIN_FONT_PT
+        chosen_w, chosen_h = bw, bh
+        found = False
+        for pt in range(self.max_font_pt, self.MIN_FONT_PT - 1, -1):
+            result = self._try_fit_at_font(
+                blk.translation, pt, bw, bh, max_w, max_h,
+            )
+            if result is not None:
+                chosen_pt = pt
+                chosen_w, chosen_h = result
+                found = True
+                break
+
+        if not found:
+            chosen_pt = self.MIN_FONT_PT
+            fm = QFontMetrics(QFont(self.font_family, self.MIN_FONT_PT))
+            needed = fm.boundingRect(
+                0, 0, max(1, max_w - 2 * self.BOX_PADDING_X), 0,
+                self.TEXT_FLAGS, blk.translation,
+            )
+            chosen_w = max_w
+            chosen_h = max(bh, needed.height() + 2 * self.BOX_PADDING_Y)
+
+        return {
+            'rect': (x1, y1, x1 + chosen_w, y1 + chosen_h),
+            'font_pt': chosen_pt,
+            'align': self.TEXT_FLAGS,
+        }
+
+    def _needed_size(self, text, pt, box_w):
+        """(outer_w, outer_h) the wrapped `text` needs in a box of width
+        `box_w` at font size `pt`, including padding. outer_w can exceed
+        box_w if an unbreakable token doesn't fit (horizontal overflow)."""
+        fm = QFontMetrics(QFont(self.font_family, pt))
+        inner_w = max(1, box_w - 2 * self.BOX_PADDING_X)
+        bbox = fm.boundingRect(0, 0, inner_w, 0, self.TEXT_FLAGS, text)
+        return (bbox.width() + 2 * self.BOX_PADDING_X,
+                bbox.height() + 2 * self.BOX_PADDING_Y)
+
+    def _expansion_bounds(self, idx):
+        """For block at `idx`, return (max_right_x, max_bottom_y) — the
+        furthest right/bottom edge the block can grow to without crossing
+        any other block's left/top edge.
+
+        Two-sided check: the other block must (a) actually be to the right /
+        below us AND (b) overlap our perpendicular range. A block far above
+        and to the right doesn't constrain rightward expansion of our row.
+
+        Bounds also clamp to the original captured region — boxes don't
+        bleed past the user's drag.
+        """
+        x1, y1, x2, y2 = self.blocks[idx].xyxy
+        orig_cap_w, orig_cap_h = self._orig_capture_size
+        max_right = orig_cap_w
+        max_bottom = orig_cap_h
+        for i, other in enumerate(self.blocks):
+            if i == idx:
+                continue
+            ox1, oy1, ox2, oy2 = other.xyxy
+            # Other to the right AND vertically overlapping → constrains width.
+            if ox1 >= x2 and not (oy2 <= y1 or oy1 >= y2):
+                max_right = min(max_right, ox1)
+            # Other below AND horizontally overlapping → constrains height.
+            if oy1 >= y2 and not (ox2 <= x1 or ox1 >= x2):
+                max_bottom = min(max_bottom, oy1)
+        return max_right, max_bottom
+
+    def _try_fit_at_font(self, text, pt, orig_w, orig_h, max_w, max_h):
+        """Find the smallest (w, h) ∈ [orig_w..max_w] × [orig_h..max_h] in
+        which `text` fits at font size `pt` with word wrap, or None if it
+        doesn't fit even at max expansion.
+
+        "Fits" means both: the rendered text doesn't overflow the box's
+        horizontal bounds (bbox.width() <= box_inner_w) AND it fits in the
+        vertical bounds (bbox.height() <= box_inner_h). Both checks matter
+        because Korean words have no inter-syllable break points — wrap a
+        long word at too-narrow a width and Qt renders it overflowing past
+        the right edge while still reporting a tall bbox.
+
+        Priority within a font size:
+          a) Original size — no expansion.
+          b) Expand in the direction matching original aspect (narrow-tall
+             balloons grow wider; wide-short balloons grow taller).
+          c) Expand both if (b) isn't enough.
+        """
+        fm = QFontMetrics(QFont(self.font_family, pt))
+        pad_x = 2 * self.BOX_PADDING_X
+        pad_y = 2 * self.BOX_PADDING_Y
+
+        def needed_at(w):
+            """Return (needed_outer_w, needed_outer_h) for a box of width `w`.
+
+            Both include padding. needed_outer_w may exceed `w` when a
+            single word can't fit in `w - pad_x` — that's the horizontal
+            overflow case we have to detect.
+            """
+            inner_w = max(1, w - pad_x)
+            bbox = fm.boundingRect(0, 0, inner_w, 0, self.TEXT_FLAGS, text)
+            return (bbox.width() + pad_x, bbox.height() + pad_y)
+
+        # a) Original size — both axes must fit.
+        nw, nh = needed_at(orig_w)
+        if nw <= orig_w and nh <= orig_h:
+            return (orig_w, orig_h)
+
+        # b) Aspect-driven preference: a balloon that's taller than wide
+        # (typical vertical Japanese) prefers width expansion; a balloon
+        # that's wider than tall prefers height expansion.
+        prefer_width_expansion = orig_h > orig_w
+
+        if prefer_width_expansion:
+            # Find smallest width that lets text fit in original height.
+            result = self._smallest_fitting_width(
+                needed_at, orig_w + 1, max_w, orig_h,
+            )
+            if result is not None:
+                return result
+            # Otherwise allow height to grow up to max_h.
+            return self._smallest_fitting_width(
+                needed_at, orig_w + 1, max_w, max_h,
+            )
+        else:
+            # Height-first: keep original width, grow height.
+            if nw <= orig_w and nh <= max_h:
+                return (orig_w, nh)
+            # Otherwise grow width too.
+            return self._smallest_fitting_width(
+                needed_at, orig_w + 1, max_w, max_h,
+            )
+
+    @staticmethod
+    def _smallest_fitting_width(needed_at, w_lo, w_hi, h_limit):
+        """Binary-search the smallest integer w in [w_lo, w_hi] for which
+        the text fits without horizontal overflow AND within height h_limit.
+
+        The "fits" predicate is monotonically True past some critical w:
+        as w grows, bbox.width() either stays at the natural min (for an
+        unbreakable word) or rises toward w, while bbox.height() falls.
+        So once both pass, they stay passing — making binary search valid.
+
+        Returns (w, h_needed) or None if even w_hi doesn't fit.
+        """
+        if w_lo > w_hi:
+            return None
+        nw, nh = needed_at(w_hi)
+        if nw > w_hi or nh > h_limit:
+            return None
+        best = None
+        lo, hi = w_lo, w_hi
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            nw, nh = needed_at(mid)
+            if nw <= mid and nh <= h_limit:
+                best = (mid, nh)
+                hi = mid - 1
+            else:
+                lo = mid + 1
+        return best
+
+    # ── Lifecycle ───────────────────────────────────────────────────────────
+
+    def show_overlay(self):
+        self.show()
+        # Re-assert position after show() — on Windows multi-monitor, a
+        # frameless + translucent + Tool window's pre-show setGeometry()
+        # call is sometimes ignored and the window pops up on the primary
+        # screen instead of where it was placed. move() after show() forces
+        # the window back to the captured region's actual coordinates.
+        x, y, _w, _h = self._capture_xywh
+        self.move(x, y)
+        self.raise_()
+
+    def mousePressEvent(self, event):
+        # Any click dismisses.
+        self.close()
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Escape, Qt.Key.Key_Return, Qt.Key.Key_Space):
+            self.close()
+
+    def closeEvent(self, event):
+        self.closed.emit()
+        super().closeEvent(event)
+
+    # ── Paint ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _to_pixmap(img: np.ndarray) -> QPixmap:
+        """Convert an HxWx3 uint8 RGB numpy array to a QPixmap.
+
+        The inpainter returns the image in the same channel order it was
+        given (we feed it RGB from capture_region), so no swap is needed.
+        Padded rows in Qt are byte-aligned; we make a contiguous copy to
+        guarantee a clean reshape.
+        """
+        if img.dtype != np.uint8:
+            img = img.astype(np.uint8)
+        if not img.flags['C_CONTIGUOUS']:
+            img = np.ascontiguousarray(img)
+        h, w = img.shape[:2]
+        if img.ndim == 2:
+            qimg = QImage(img.data, w, h, w, QImage.Format.Format_Grayscale8)
+        else:
+            qimg = QImage(img.data, w, h, w * 3, QImage.Format.Format_RGB888)
+        # QImage shares memory with the numpy buffer; copy() detaches so
+        # the pixmap survives the source array going out of scope.
+        return QPixmap.fromImage(qimg.copy())
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+
+        # Mode A — inpaint background: paint the cleaned image first,
+        # then render translations directly on top (no white boxes
+        # because the original text is already gone from the pixels).
+        # Mode B — translucent: keep the white-box-with-text style on top
+        # of the unmodified screen content.
+        inpaint_mode = self._background_pixmap is not None
+        if inpaint_mode:
+            # The inpainted image matches the ORIGINAL captured region
+            # (capture_xywh's w/h before layout grew the widget). When the
+            # widget grew to accommodate expanded text boxes, the extra
+            # area sits outside the image — we leave it transparent so the
+            # user's screen content shows through there.
+            orig_w, orig_h = self._orig_capture_size
+            painter.drawPixmap(0, 0, orig_w, orig_h, self._background_pixmap)
+
+        for blk, item in zip(self.blocks, self._layout):
+            x1, y1, x2, y2 = item['rect']
+            w, h = max(1, x2 - x1), max(1, y2 - y1)
+            rect = QRect(x1, y1, w, h)
+
+            if not inpaint_mode:
+                # Mode B: translucent white box over the unmodified region
+                # so the original text doesn't bleed through.
+                painter.setBrush(QColor(255, 255, 255,
+                                        int(255 * self.box_opacity)))
+                painter.setPen(QPen(QColor(64, 96, 128, 200), 1))
+                painter.drawRoundedRect(rect, 4, 4)
+
+            # Per-block font: _compute_layout picked the largest size where
+            # the wrapped translation fits its box. Balloon-filled blocks are
+            # centered (align == ALIGN_CENTER); text-box blocks are top-left.
+            f = QFont(self.font_family, item['font_pt'])
+            f.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+            painter.setFont(f)
+            painter.setPen(QColor(20, 20, 20))
+            painter.drawText(
+                rect.adjusted(self.BOX_PADDING_X, self.BOX_PADDING_Y,
+                              -self.BOX_PADDING_X, -self.BOX_PADDING_Y),
+                item.get('align', self.TEXT_FLAGS),
+                blk.translation,
+            )
+
+        # Tiny dismiss hint in the corner so first-time users know how to
+        # close it. Drawn last so it sits on top of any block. Uses the
+        # configured max font, not any per-block adjusted size — the hint
+        # should be consistent regardless of how blocks shrunk.
+        painter.setFont(self.font)
+        fm = QFontMetrics(self.font)
+        hint = '클릭/ESC로 닫기'
+        hint_rect = fm.boundingRect(hint)
+        bg = QRect(
+            self.width() - hint_rect.width() - 16,
+            self.height() - hint_rect.height() - 12,
+            hint_rect.width() + 12,
+            hint_rect.height() + 8,
+        )
+        painter.setBrush(QColor(0, 0, 0, 160))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(bg, 4, 4)
+        painter.setPen(QColor(220, 220, 220))
+        painter.drawText(bg, Qt.AlignmentFlag.AlignCenter, hint)
