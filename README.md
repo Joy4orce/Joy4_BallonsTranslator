@@ -1,3 +1,22 @@
+# Joy4_BallonsTranslator
+
+> ### About this fork
+>
+> This is a customized fork of **[BallonsTranslator](https://github.com/dmMaze/BallonsTranslator)** by **[@dmMaze](https://github.com/dmMaze)** — a deep-learning–assisted manga/comic translation tool. All credit for the core engine, models, and UI design belongs to the original authors. The upstream project is licensed under **GPL v3** (see [LICENSE](LICENSE)); this fork preserves that license unchanged, and the modifications below are released under the same terms.
+>
+> **Changes in this fork**
+> - **Claude translator** (`modules/translators/trans_claude.py`) — Anthropic Claude API as a translation backend.
+> - **Local LLM translator** (`modules/translators/trans_local_llm.py`) — OpenAI-compatible local endpoints (Ollama, LM Studio, etc.) as a translation backend.
+> - **Screen translator** (`tools/screen_translator/`, `launch_screen_translator.bat`) — Yomichan-style on-screen overlay that reuses the project's detection / OCR / translator stack to translate any image on screen.
+> - **Reading-order–aware batching** (`modules/translators/base.py`) — orders blocks top-to-bottom and right-to-left for JP/CN sources so context-aware (LLM) translators see a panel in narrative order.
+> - **OCR improvements** (`modules/ocr/manga_ocr.py`, `modules/ocr/__init__.py`).
+> - **UI tweaks** — shared constants, combobox, and font-style preset widget under `ui/`; recolored icon set.
+> - **macOS build script** (`scripts/macos-build-script.sh`).
+>
+> Upstream documentation follows.
+>
+> ---
+
 # BallonTranslator
 简体中文 | [English](README_EN.md) | [Русский](doc/README_RU.md) | [日本語](doc/README_JA.md) | [Indonesia](doc/README_ID.md)
 
