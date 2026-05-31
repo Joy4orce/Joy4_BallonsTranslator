@@ -11,7 +11,8 @@ from typing import List, Optional
 import numpy as np
 from qtpy.QtCore import Qt, QRect, QTimer, Signal
 from qtpy.QtGui import (
-    QPainter, QColor, QImage, QPen, QFont, QFontMetrics, QPalette, QPixmap
+    QPainter, QColor, QImage, QPen, QFont, QFontMetrics, QPalette, QPixmap,
+    QGuiApplication,
 )
 from qtpy.QtWidgets import QWidget
 
@@ -93,6 +94,13 @@ class ResultOverlay(QWidget):
 
         self._capture_xywh = (x, y, w, h)
         self.setGeometry(x, y, w, h)
+
+        # Right-click copy state. `_suppress_hint` blanks the corner dismiss
+        # hint during a grab() so the copied image is clean. `_show_copy_hint`
+        # briefly replaces the dismiss text with a "복사됨" confirmation after
+        # the copy lands on the clipboard.
+        self._suppress_hint = False
+        self._show_copy_hint = False
 
         if auto_dismiss_ms > 0:
             QTimer.singleShot(auto_dismiss_ms, self.close)
@@ -342,12 +350,48 @@ class ResultOverlay(QWidget):
         self.raise_()
 
     def mousePressEvent(self, event):
-        # Any click dismisses.
+        # Right-click copies the rendered overlay (inpainted background +
+        # translation text) to the clipboard without dismissing — the user
+        # often wants to keep reading after grabbing the image. Any other
+        # button dismisses, preserving the original click-to-close UX.
+        if event.button() == Qt.MouseButton.RightButton:
+            self._copy_to_clipboard()
+            return
         self.close()
 
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key.Key_Escape, Qt.Key.Key_Return, Qt.Key.Key_Space):
             self.close()
+
+    def _copy_to_clipboard(self):
+        """Grab the overlay's current rendering and push it to the system
+        clipboard as a QPixmap.
+
+        The corner dismiss hint is suppressed during the grab so it doesn't
+        leak into the copied image — users pasting into a doc/chat want the
+        translated panel, not our UI chrome. After the copy, the hint flips
+        to a "복사됨 ✓" confirmation for 1.5 s so the user can tell it
+        worked (the overlay stays open).
+        """
+        self._suppress_hint = True
+        try:
+            pixmap = self.grab()
+        finally:
+            self._suppress_hint = False
+        QGuiApplication.clipboard().setPixmap(pixmap)
+
+        self._show_copy_hint = True
+        self.update()
+        QTimer.singleShot(1500, self._clear_copy_hint)
+
+    def _clear_copy_hint(self):
+        # The overlay may already be closed by the time the timer fires
+        # (user dismissed before 1.5 s elapsed). Guard against painting a
+        # destroyed widget.
+        if not self.isVisible():
+            return
+        self._show_copy_hint = False
+        self.update()
 
     def closeEvent(self, event):
         self.closed.emit()
@@ -425,21 +469,25 @@ class ResultOverlay(QWidget):
             )
 
         # Tiny dismiss hint in the corner so first-time users know how to
-        # close it. Drawn last so it sits on top of any block. Uses the
-        # configured max font, not any per-block adjusted size — the hint
-        # should be consistent regardless of how blocks shrunk.
-        painter.setFont(self.font)
-        fm = QFontMetrics(self.font)
-        hint = '클릭/ESC로 닫기'
-        hint_rect = fm.boundingRect(hint)
-        bg = QRect(
-            self.width() - hint_rect.width() - 16,
-            self.height() - hint_rect.height() - 12,
-            hint_rect.width() + 12,
-            hint_rect.height() + 8,
-        )
-        painter.setBrush(QColor(0, 0, 0, 160))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawRoundedRect(bg, 4, 4)
-        painter.setPen(QColor(220, 220, 220))
-        painter.drawText(bg, Qt.AlignmentFlag.AlignCenter, hint)
+        # close it (and that right-click copies). Skipped entirely when a
+        # clipboard grab is in progress so our UI chrome doesn't end up in
+        # the copied image. Uses the configured max font, not any per-block
+        # adjusted size — the hint should be consistent regardless of how
+        # blocks shrunk.
+        if not self._suppress_hint:
+            painter.setFont(self.font)
+            fm = QFontMetrics(self.font)
+            hint = '복사됨 ✓' if self._show_copy_hint \
+                else '좌클릭/ESC 닫기 · 우클릭 복사'
+            hint_rect = fm.boundingRect(hint)
+            bg = QRect(
+                self.width() - hint_rect.width() - 16,
+                self.height() - hint_rect.height() - 12,
+                hint_rect.width() + 12,
+                hint_rect.height() + 8,
+            )
+            painter.setBrush(QColor(0, 0, 0, 160))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawRoundedRect(bg, 4, 4)
+            painter.setPen(QColor(220, 220, 220))
+            painter.drawText(bg, Qt.AlignmentFlag.AlignCenter, hint)
