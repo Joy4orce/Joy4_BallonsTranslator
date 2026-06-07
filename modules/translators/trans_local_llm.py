@@ -45,6 +45,7 @@ _RE_THINK_BLOCK = re.compile(
 def _parse_json_array(text: str) -> List[str]:
     cleaned = _RE_THINK_BLOCK.sub("", text)
     cleaned = _strip_markdown_fences(cleaned)
+    # 1) Straight parse — the well-behaved case.
     try:
         data = json.loads(cleaned)
         if isinstance(data, list):
@@ -55,10 +56,23 @@ def _parse_json_array(text: str) -> List[str]:
                     return [str(x) for x in data[key]]
     except json.JSONDecodeError:
         pass
+    # 2) Embedded array — the model wrapped the array in prose.
     match = re.search(r'\[.*\]', cleaned, re.DOTALL)
     if match:
         try:
             data = json.loads(match.group())
+            if isinstance(data, list):
+                return [str(x) for x in data]
+        except json.JSONDecodeError:
+            pass
+    # 3) Missing outer brackets — a very common model mistake: emits
+    #    `"a", "b", "c"` instead of `["a", "b", "c"]`. Detect a leading
+    #    quote followed by a quoted-comma-quoted pattern and wrap.
+    stripped = cleaned.strip().rstrip(',').strip()
+    if stripped.startswith('"') and stripped.endswith('"') \
+            and re.search(r'"\s*,\s*"', stripped):
+        try:
+            data = json.loads('[' + stripped + ']')
             if isinstance(data, list):
                 return [str(x) for x in data]
         except json.JSONDecodeError:
@@ -131,8 +145,11 @@ class LocalLLMTranslator(BaseTranslator):
             "Preserve empty strings as empty strings. "
             "Do not merge, split, add, or remove entries. "
             "Output ONLY the raw JSON array. "
+            "The output MUST start with `[` and end with `]`. "
             "Do NOT wrap the output in markdown code fences. "
-            "Do NOT add any prose, explanation, or commentary before or after the array."
+            "Do NOT add any prose, explanation, or commentary before or after the array.\n\n"
+            'Example input:  ["Hello", "", "Goodbye"]\n'
+            'Example output: ["안녕하세요", "", "안녕히 가세요"]'
         )
         return user_prompt + suffix
 
