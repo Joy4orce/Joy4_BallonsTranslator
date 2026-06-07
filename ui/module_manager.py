@@ -59,7 +59,8 @@ class ModuleThread(QThread):
         except Exception as e:
             self.module = old_module
             msg = self.tr('Failed to set ') + module_name
-            
+
+            LOGGER.exception(msg)
             self.exception_occurred.emit(msg, str(e), traceback.format_exc())
         self.finish_set_module.emit()
 
@@ -116,6 +117,7 @@ class InpaintThread(ModuleThread):
             }
             self.finish_inpaint.emit(inpaint_dict)
         except Exception as e:
+            LOGGER.exception('Inpainting Failed.')
             self.exception_occurred.emit(self.tr('Inpainting Failed.'), str(e), traceback.format_exc())
             self.inpainting = False
         self.inpainting = False
@@ -181,6 +183,7 @@ class TranslateThread(ModuleThread):
                 old_translator = TRANSLATORS.module_dict['google']('简体中文', 'English', raise_unsupported_lang=False)
             self.translator = old_translator
             msg = self.tr('Failed to set translator ') + translator
+            LOGGER.exception(msg)
             self.exception_occurred.emit(msg, repr(e), traceback.format_exc())
         self.module = self.translator
         self.finish_set_module.emit()
@@ -200,11 +203,13 @@ class TranslateThread(ModuleThread):
             if raise_exception:
                 raise e
             else:
+                LOGGER.exception('Missing translator params')
                 self.exception_occurred.emit(e + self.tr(' is required for '), '', traceback.format_exc())
         except Exception as e:
             if raise_exception:
                 raise e
             else:
+                LOGGER.exception('Translation Failed.')
                 self.exception_occurred.emit(self.tr('Translation Failed.'), repr(e), traceback.format_exc())
         if emit_finished:
             self.finish_translate_page.emit(page_key)
@@ -240,8 +245,9 @@ class TranslateThread(ModuleThread):
                 msg = self.tr('Translation Failed.')
                 if isinstance(e, MissingTranslatorParams):
                     msg = msg + '\n' + str(e) + self.tr(' is required for ' + self.translator.name)
-                    
+
                 self.blockSignals(False)
+                LOGGER.exception(msg)
                 self.exception_occurred.emit(msg, repr(e), traceback.format_exc())
                 self.imgtrans_proj = None
                 self.finished_counter = 0
@@ -422,6 +428,7 @@ class ImgtransThread(QThread):
                 except Exception as e:
                     cfg_module.enable_translate = False
                     self.update_translate_progress.emit(num_pages)
+                    LOGGER.exception('Translation Failed (sync path; enable_translate auto-disabled).')
                     self.exception_occurred.emit(self.tr('Translation Failed.'), repr(e))
                         
             if cfg_module.enable_inpaint:
