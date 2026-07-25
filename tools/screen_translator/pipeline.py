@@ -284,22 +284,15 @@ class TranslationPipeline:
                     cv2.MORPH_ELLIPSE, (2 * ksize + 1, 2 * ksize + 1),
                 )
                 inpaint_mask = cv2.dilate(mask, element)
-                inpainted_img = self._inpainter.inpaint(img, inpaint_mask, blk_list)
 
-                # Confine the result to the mask. The inpainter rewrites far
-                # more than it was asked to — measured at 12.4% of the page for
-                # a 0.4% mask — because it writes back whole enlarged crops per
-                # block and, on a flat balloon, floods the balloon with its
-                # average colour. Either way the untouched artwork comes back
-                # resampled or flattened, which drains the contrast out of line
-                # art and reads as a washed-out, over-bright page. Compositing
-                # here keeps every unmasked pixel bit-exact, so whatever the
-                # inpainter does outside the mask stops mattering.
-                if inpainted_img is not None and inpainted_img.shape == img.shape:
-                    keep = (inpaint_mask >= 127)
-                    if keep.ndim == 2:
-                        keep = keep[:, :, None]
-                    inpainted_img = np.where(keep, inpainted_img, img)
+                # InpainterBase.inpaint() ZEROES the mask it is given, block by
+                # block, as it works (modules/inpaint/base.py:109 — the
+                # inpaint_by_block path, which is the default). Anything that
+                # needs to know what was masked has to snapshot it first, or it
+                # reads back a mask with exactly the text areas erased.
+                mask_px = int(np.count_nonzero(inpaint_mask >= 127))
+
+                inpainted_img = self._inpainter.inpaint(img, inpaint_mask, blk_list)
 
                 # How much of the page the inpainter actually rewrote. The
                 # detector can produce a very broad mask on sketchy or
@@ -309,7 +302,6 @@ class TranslationPipeline:
                 # that visible instead of leaving it to guesswork.
                 if inpainted_img is not None:
                     total = img.shape[0] * img.shape[1]
-                    mask_px = int(np.count_nonzero(inpaint_mask >= 127))
                     changed = int(np.count_nonzero(
                         np.any(inpainted_img != img, axis=2)))
                     print(f'[screen_translator] inpaint: mask covers '
