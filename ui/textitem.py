@@ -17,6 +17,22 @@ TEXTRECT_SHOW_COLOR = QColor(30, 147, 229, 170)
 TEXTRECT_SELECTED_COLOR = QColor(248, 64, 147, 170)
 
 
+def _axis_shift(lo: float, hi: float, limit: float) -> float:
+    '''Offset needed to slide the span [lo, hi] into [0, limit].
+
+    A span longer than the limit is pinned to the near edge: the far end still
+    sticks out, but the text starts where it can be read instead of starting
+    off-page.
+    '''
+    if hi - lo >= limit:
+        return -lo
+    if lo < 0:
+        return -lo
+    if hi > limit:
+        return limit - hi
+    return 0.0
+
+
 class TextBlkItem(QGraphicsTextItem):
 
     begin_edit = Signal(int)
@@ -338,6 +354,31 @@ class TextBlkItem(QGraphicsTextItem):
         if qrect:
             return QRectF(x, y, w, h)
         return [math.ceil(x), math.ceil(y), math.ceil(w), math.ceil(h)]
+
+    def keepInsidePage(self, page_w: float, page_h: float) -> bool:
+        '''Slide the item so every glyph stays on the page. Returns True if moved.
+
+        Auto layout sizes the box to hold the whole translation, which can push
+        it past the image edge — a narrow vertical source box relaid out
+        horizontally grows a lot. render_result_img() only paints the page rect,
+        so whatever hangs outside is cropped from the exported image and lost.
+        Moving the box back in keeps every glyph visible at the cost of
+        overlapping neighbouring art, which is the trade we want: too wide is
+        better than missing.
+
+        Uses sceneBoundingRect() so padding, scale and rotation are accounted
+        for, and works before the item has been added to a scene (which is when
+        the translation pipeline lays blocks out).
+        '''
+        if page_w <= 0 or page_h <= 0:
+            return False
+        br = self.sceneBoundingRect()
+        dx = _axis_shift(br.left(), br.right(), page_w)
+        dy = _axis_shift(br.top(), br.bottom(), page_h)
+        if dx == 0 and dy == 0:
+            return False
+        self.setPos(self.pos() + QPointF(dx, dy))
+        return True
 
     def shape(self) -> QPainterPath:
         path = QPainterPath()
