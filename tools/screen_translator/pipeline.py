@@ -353,12 +353,22 @@ class TranslationPipeline:
         bounding box in image coords, or None if no clean balloon is found.
 
         Uses BallonsTranslator's classical-CV balloon segmentation
-        (Canny + flood fill). Several sanity checks reject bogus results so a
-        detection miss never produces a worse layout than the text bbox:
-          - balloon must be larger than the text bbox
-          - balloon must contain the text bbox center
-          - balloon must not fill (almost) the entire enlarged crop, which
-            would mean flood-fill leaked / there's no real enclosed region
+        (Canny + flood fill), which works on a crop around the text. The crop
+        has to be big enough to hold the WHOLE balloon: the flood fill stops at
+        the crop border just as readily as at an outline, so too small a crop
+        reports a region barely larger than the text and the caller lays the
+        translation out as if there were no balloon at all. A rectangular
+        caption frame holding several vertical lines is much wider than the ink
+        inside it, so a fixed 2x crop reliably cut it off.
+
+        So try progressively larger crops and only trust a region that is fully
+        enclosed by its crop. Touching a crop edge means the fill was cut off
+        (or leaked across flat background) and the true extent is unknown —
+        unless that edge is the image edge, where touching is real.
+
+        Sanity checks keep a miss from producing a worse layout than the text
+        bbox: the region must be larger than the text bbox and must contain its
+        center.
         """
         try:
             from utils.imgproc_utils import extract_ballon_region
@@ -367,50 +377,66 @@ class TranslationPipeline:
             tw, th = x2 - x1, y2 - y1
             if tw < 2 or th < 2:
                 return None
-
-            # extract_ballon_region takes [x, y, w, h] and returns
-            # (mask, area, [cx1,cy1,cx2,cy2] enlarged-crop-in-image-coords,
-            #  (lx,ly,lw,lh) balloon-bbox-within-crop).
-            result = extract_ballon_region(
-                img, [x1, y1, tw, th],
-                enlarge_ratio=2.0, cal_region_rect=True,
-            )
-            if len(result) < 4:
-                return None
-            _mask, _area, crop_rect, local_rect = result
-            cx1, cy1, cx2, cy2 = crop_rect
-            lx, ly, lw, lh = local_rect
-            if lw <= 0 or lh <= 0:
-                return None
-
-            # Balloon bbox in image coords.
-            bx1 = cx1 + lx
-            by1 = cy1 + ly
-            bx2 = bx1 + lw
-            by2 = by1 + lh
-
-            crop_w = max(1, cx2 - cx1)
-            crop_h = max(1, cy2 - cy1)
-
-            # Sanity 1: balloon must be at least as big as the text bbox.
-            if lw * lh < tw * th:
-                return None
-            # Sanity 2: balloon must contain the text bbox center.
-            tcx, tcy = (x1 + x2) / 2, (y1 + y2) / 2
-            if not (bx1 <= tcx <= bx2 and by1 <= tcy <= by2):
-                return None
-            # Sanity 3: balloon must not be ~the entire enlarged crop (a sign
-            # flood-fill found no enclosed region and filled everything).
-            if lw >= crop_w * 0.97 and lh >= crop_h * 0.97:
-                return None
-
-            # Clamp to image bounds.
             ih, iw = img.shape[:2]
-            bx1 = max(0, int(bx1)); by1 = max(0, int(by1))
-            bx2 = min(iw, int(bx2)); by2 = min(ih, int(by2))
-            if bx2 - bx1 < 2 or by2 - by1 < 2:
-                return None
-            return (bx1, by1, bx2, by2)
+            tcx, tcy = (x1 + x2) / 2, (y1 + y2) / 2
+
+            # extract_ballon_region shapes its crop to the aspect ratio of the
+            # rect it is given, so a tall narrow column of vertical text yields
+            # a tall narrow crop that cannot contain a wide balloon no matter
+            # how much it is enlarged. Probe with a square rect on the same
+            # center instead; only the crop geometry and the fill seed come from
+            # it, and the seed stays inside the balloon either way.
+            side = max(tw, th)
+            probe = [int(tcx - side / 2), int(tcy - side / 2), side, side]
+
+            for enlarge_ratio in (2.0, 3.0, 4.5):
+                # extract_ballon_region takes [x, y, w, h] and returns
+                # (mask, area, [cx1,cy1,cx2,cy2] enlarged-crop-in-image-coords,
+                #  (lx,ly,lw,lh) balloon-bbox-within-crop, crop-scale undone).
+                result = extract_ballon_region(
+                    img, probe,
+                    enlarge_ratio=enlarge_ratio, cal_region_rect=True,
+                )
+                if len(result) < 4:
+                    continue
+                _mask, _area, crop_rect, local_rect = result
+                cx1, cy1, cx2, cy2 = crop_rect
+                lx, ly, lw, lh = local_rect
+                if lw <= 0 or lh <= 0:
+                    continue
+
+                crop_w = max(1, cx2 - cx1)
+                crop_h = max(1, cy2 - cy1)
+
+                bx1 = cx1 + lx
+                by1 = cy1 + ly
+                bx2 = bx1 + lw
+                by2 = by1 + lh
+
+                if lw * lh < tw * th:
+                    continue
+                if not (bx1 <= tcx <= bx2 and by1 <= tcy <= by2):
+                    continue
+
+                # Enclosed check. An edge of the crop that is also an edge of
+                # the image is a real boundary, so touching it is allowed.
+                m = 2
+                clipped = (
+                    (lx <= m and cx1 > 0)
+                    or (ly <= m and cy1 > 0)
+                    or (lx + lw >= crop_w - m and cx2 < iw)
+                    or (ly + lh >= crop_h - m and cy2 < ih)
+                )
+                if clipped:
+                    continue
+
+                bx1 = max(0, int(bx1)); by1 = max(0, int(by1))
+                bx2 = min(iw, int(bx2)); by2 = min(ih, int(by2))
+                if bx2 - bx1 < 2 or by2 - by1 < 2:
+                    continue
+                return (bx1, by1, bx2, by2)
+
+            return None
         except Exception as e:
             print(f'[screen_translator] balloon detect failed '
                   f'({type(e).__name__}: {e}); using text bbox')
