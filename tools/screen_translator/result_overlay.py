@@ -40,6 +40,7 @@ class ResultOverlay(QWidget):
 
     def __init__(self, blocks: List[TranslatedBlock], capture_xywh: tuple,
                  *, inpainted_img: Optional[np.ndarray] = None,
+                 raw_img: Optional[np.ndarray] = None,
                  source_size: Optional[tuple] = None,
                  auto_dismiss_ms: int = 0, box_opacity: float = 0.85,
                  font_family: str = 'Malgun Gothic', font_size: int = 14):
@@ -59,6 +60,12 @@ class ResultOverlay(QWidget):
         # erased from the background). When None, falls back to translucent
         # white boxes over the unmodified screen content.
         self._background_pixmap = self._to_pixmap(inpainted_img) if inpainted_img is not None else None
+
+        # The unmodified capture. Not painted on screen — in translucent mode
+        # the live screen showing through IS the page. It exists so the
+        # clipboard copy has something opaque to composite onto; see
+        # _copy_to_clipboard.
+        self._raw_pixmap = self._to_pixmap(raw_img) if raw_img is not None else None
 
         # Frameless, always-on-top, transparent, no taskbar entry. Cursor
         # stays normal so users can move their mouse off to the side; the
@@ -503,12 +510,31 @@ class ResultOverlay(QWidget):
         translated panel, not our UI chrome. After the copy, the hint flips
         to a "복사됨 ✓" confirmation for 1.5 s so the user can tell it
         worked (the overlay stays open).
+
+        Without an inpainted background the widget is translucent and paints
+        only the boxes and text, so grab() comes back ~99% transparent — the
+        page itself is the live screen underneath, which a widget grab cannot
+        see. Pasted anywhere with a white background that reads as a blank,
+        washed-out page. Compositing the grab over the captured pixels gives
+        the copy the artwork it is supposed to carry.
         """
         self._suppress_hint = True
         try:
             pixmap = self.grab()
         finally:
             self._suppress_hint = False
+
+        base = self._background_pixmap or self._raw_pixmap
+        if base is not None and pixmap.hasAlphaChannel():
+            flat = QPixmap(pixmap.size())
+            flat.setDevicePixelRatio(pixmap.devicePixelRatio())
+            painter = QPainter(flat)
+            cap_w, cap_h = self._orig_capture_size
+            painter.drawPixmap(0, 0, cap_w, cap_h, base)
+            painter.drawPixmap(0, 0, cap_w, cap_h, pixmap)
+            painter.end()
+            pixmap = flat
+
         QGuiApplication.clipboard().setPixmap(pixmap)
 
         self._show_copy_hint = True

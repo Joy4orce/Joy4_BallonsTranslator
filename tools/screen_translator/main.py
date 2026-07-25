@@ -359,6 +359,9 @@ class ScreenTranslatorApp(QObject):
         # HiDPI screen this is larger than (w, h). The overlay needs it to map
         # pipeline block coords back into its own logical geometry.
         self._capture_img_size = (img.shape[1], img.shape[0])
+        # Kept so the overlay's clipboard copy can composite onto the page even
+        # when inpainting produced nothing to paint.
+        self._capture_img = img
 
         # Re-read BT's config.json on every capture so settings changed in the
         # main app (translator switch, language pair, API key, etc.) take
@@ -465,6 +468,7 @@ class ScreenTranslatorApp(QObject):
             blocks=blocks,
             capture_xywh=capture_xywh,
             inpainted_img=inpainted_img,
+            raw_img=getattr(self, '_capture_img', None),
             source_size=getattr(self, '_capture_img_size', None),
             auto_dismiss_ms=settings.overlay_auto_dismiss_ms,
             box_opacity=settings.overlay_box_opacity,
