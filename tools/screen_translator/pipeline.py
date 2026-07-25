@@ -285,6 +285,22 @@ class TranslationPipeline:
                 )
                 inpaint_mask = cv2.dilate(mask, element)
                 inpainted_img = self._inpainter.inpaint(img, inpaint_mask, blk_list)
+
+                # How much of the page the inpainter actually rewrote. The
+                # detector can produce a very broad mask on sketchy or
+                # low-contrast art, and then the model repaints most of the
+                # image — which reads as a washed-out, over-bright result
+                # rather than as an obvious failure. Logging coverage makes
+                # that visible instead of leaving it to guesswork.
+                if inpainted_img is not None:
+                    total = img.shape[0] * img.shape[1]
+                    mask_px = int(np.count_nonzero(inpaint_mask >= 127))
+                    changed = int(np.count_nonzero(
+                        np.any(inpainted_img != img, axis=2)))
+                    print(f'[screen_translator] inpaint: mask covers '
+                          f'{mask_px / total:.1%}, {changed / total:.1%} of '
+                          f'pixels rewritten, mean brightness '
+                          f'{img.mean():.1f} -> {inpainted_img.mean():.1f}')
             except Exception as e:
                 # If inpaint fails for any reason, fall back to no-inpaint
                 # mode: the overlay will just paint translation boxes on the
