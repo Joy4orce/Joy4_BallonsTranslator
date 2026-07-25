@@ -1,11 +1,14 @@
 """Floating always-on-top overlay that draws translations at each detected
 balloon's bbox.
 
-Sized and positioned to match the captured screen region exactly, so block
-coordinates from the pipeline (which are in capture-image space) map 1:1 to
-overlay coordinates. Click or ESC dismisses; optional auto-timeout.
+Sized and positioned to match the captured screen region. Block coordinates
+from the pipeline are in capture-IMAGE space, which is physical pixels, while
+the widget's geometry is logical — the two differ by the screen's
+devicePixelRatio, so `source_size` is used to rescale them. Click or ESC
+dismisses; optional auto-timeout.
 """
 
+from dataclasses import replace
 from typing import List, Optional
 
 import numpy as np
@@ -37,6 +40,7 @@ class ResultOverlay(QWidget):
 
     def __init__(self, blocks: List[TranslatedBlock], capture_xywh: tuple,
                  *, inpainted_img: Optional[np.ndarray] = None,
+                 source_size: Optional[tuple] = None,
                  auto_dismiss_ms: int = 0, box_opacity: float = 0.85,
                  font_family: str = 'Malgun Gothic', font_size: int = 14):
         super().__init__()
@@ -79,18 +83,22 @@ class ResultOverlay(QWidget):
         _, _, orig_cap_w, orig_cap_h = capture_xywh
         self._orig_capture_size = (orig_cap_w, orig_cap_h)
 
+        # Block coords arrive in capture-image (physical) pixels; the widget is
+        # laid out in logical ones. Convert before laying anything out so the
+        # font-fitting search also works against logical box sizes.
+        self.blocks = self._to_overlay_space(self.blocks, source_size)
+
         # For each block, decide the largest font size that fits, expanding
         # the box into whatever room is available between neighboring blocks.
         # See _compute_layout's docstring for the full algorithm.
         self._layout = self._compute_layout()
 
-        # Grow the overlay window itself if any expanded box extends below
-        # / beyond the captured region. Otherwise text past the widget's
-        # right or bottom edge would get clipped by the parent surface.
+        # The overlay is exactly the region the user dragged. Boxes are kept
+        # inside it by _clamp_to_region, so there is nothing hanging past the
+        # edges to make room for. Growing the window instead (what this used
+        # to do) added blank strips on the right/bottom and drew the text out
+        # there, away from the balloon it belongs to.
         x, y, w, h = capture_xywh
-        if self._layout:
-            w = max(w, max(item['rect'][2] for item in self._layout))
-            h = max(h, max(item['rect'][3] for item in self._layout))
 
         self._capture_xywh = (x, y, w, h)
         self.setGeometry(x, y, w, h)
@@ -137,34 +145,144 @@ class ResultOverlay(QWidget):
                 out.append(self._layout_in_textbox(idx, blk))
         return out
 
+    def _to_overlay_space(self, blocks, source_size):
+        """Rescale block coords from capture-image pixels to overlay coords.
+
+        QScreen.grabWindow() takes a LOGICAL rect but hands back a pixmap in
+        PHYSICAL pixels, so on a HiDPI screen the captured image — and with it
+        every coordinate the pipeline derives from it — is devicePixelRatio
+        times larger than this widget, whose geometry is logical. Left
+        unscaled, a block's text lands further down-right the further it sits
+        from the top-left corner, drawn over the artwork instead of its
+        balloon. The inpainted background hid the mismatch because it is
+        explicitly scaled into the region when painted.
+
+        No-ops at ratio 1 (no HiDPI scaling) and when `source_size` is unknown.
+        """
+        if not source_size:
+            return blocks
+        src_w, src_h = source_size
+        if src_w <= 0 or src_h <= 0:
+            return blocks
+        cap_w, cap_h = self._orig_capture_size
+        sx, sy = cap_w / src_w, cap_h / src_h
+        if abs(sx - 1) < 1e-3 and abs(sy - 1) < 1e-3:
+            return blocks
+
+        def rescale(box):
+            if box is None:
+                return None
+            x1, y1, x2, y2 = box
+            return (int(round(x1 * sx)), int(round(y1 * sy)),
+                    int(round(x2 * sx)), int(round(y2 * sy)))
+
+        return [replace(b, xyxy=rescale(b.xyxy),
+                        balloon_xyxy=rescale(b.balloon_xyxy)) for b in blocks]
+
+    def _clamp_to_region(self, rect):
+        """Slide `rect` (x1, y1, x2, y2) back inside the captured region.
+
+        The overlay widget is exactly the captured region, so anything outside
+        it is clipped by the window surface and simply never seen. Moving a box
+        back in keeps every glyph visible; the text may then sit off its
+        balloon, which is the lesser evil — before this, an overflowing box
+        made the widget grow and the text was drawn in the blank strip that
+        appeared on the right/bottom, nowhere near its balloon.
+
+        Size is preserved. A box genuinely larger than the region is pinned to
+        the near edge and trimmed to the region, since there is nowhere else
+        for it to go.
+        """
+        cap_w, cap_h = self._orig_capture_size
+        x1, y1, x2, y2 = (int(v) for v in rect)
+        w, h = max(1, x2 - x1), max(1, y2 - y1)
+
+        if w >= cap_w:
+            x1, w = 0, cap_w
+        else:
+            x1 = min(max(x1, 0), cap_w - w)
+        if h >= cap_h:
+            y1, h = 0, cap_h
+        else:
+            y1 = min(max(y1, 0), cap_h - h)
+
+        return (x1, y1, x1 + w, y1 + h)
+
     def _layout_in_balloon(self, blk, balloon):
-        """Fit the translation inside the balloon box, centered. Picks the
-        largest font (max → MIN) whose wrapped text fits the balloon. If even
-        MIN_FONT_PT doesn't fit, keeps MIN and grows the box downward (rare —
-        balloons are large)."""
+        """Fit the translation to the balloon, centered.
+
+        Readability order: fill the balloon at the largest font that fits →
+        spill outside the balloon rather than shrink further → shrink only when
+        even the region has no room. Showing all of the text matters more than
+        respecting the balloon outline, so the box is allowed to grow past it;
+        what is never acceptable is text clipped away where the balloon still
+        looks half empty.
+        """
         bx1, by1, bx2, by2 = [int(v) for v in balloon]
         bw = max(1, bx2 - bx1)
         bh = max(1, by2 - by1)
+        cap_w, cap_h = self._orig_capture_size
 
-        chosen_pt = self.MIN_FONT_PT
-        final_h = bh
+        # 1) Largest font whose wrapped text fits the balloon untouched.
         for pt in range(self.max_font_pt, self.MIN_FONT_PT - 1, -1):
             nw, nh = self._needed_size(blk.translation, pt, bw)
             if nw <= bw and nh <= bh:
-                chosen_pt = pt
-                break
-        else:
-            # Doesn't fit even at the minimum font — grow height so nothing
-            # is clipped (widget will enlarge to fit in __init__).
-            _nw, nh = self._needed_size(blk.translation, self.MIN_FONT_PT, bw)
-            chosen_pt = self.MIN_FONT_PT
-            final_h = max(bh, nh)
+                return {
+                    'rect': self._clamp_to_region((bx1, by1, bx2, by2)),
+                    'font_pt': pt,
+                    'align': self.ALIGN_CENTER,
+                }
 
+        # 2) Too small at every font size. Keep the font as large as possible
+        #    and let the box spill outside the balloon instead, bounded by the
+        #    captured region, centered so the text stays visually attached.
+        for pt in range(self.max_font_pt, self.MIN_FONT_PT - 1, -1):
+            fitted = self._fit_in_expanded_box(
+                blk.translation, pt, bw, cap_w, cap_h,
+            )
+            if fitted is not None:
+                w, h = fitted
+                return {
+                    'rect': self._clamp_to_region(
+                        self._centered_on(balloon, max(bw, w), max(bh, h))),
+                    'font_pt': pt,
+                    'align': self.ALIGN_CENTER,
+                }
+
+        # 3) Even the minimum font needs more than the whole region. Take its
+        #    natural size so as much as possible shows; the clamp trims the
+        #    rest because there is nowhere left to grow.
+        nw, nh = self._needed_size(blk.translation, self.MIN_FONT_PT, cap_w)
         return {
-            'rect': (bx1, by1, bx2, by1 + final_h),
-            'font_pt': chosen_pt,
+            'rect': self._clamp_to_region(
+                self._centered_on(balloon, max(bw, nw), max(bh, nh))),
+            'font_pt': self.MIN_FONT_PT,
             'align': self.ALIGN_CENTER,
         }
+
+    def _fit_in_expanded_box(self, text, pt, min_w, max_w, max_h):
+        """Smallest (w, h) that holds `text` at font `pt`, searching widths in
+        [min_w, max_w] and requiring height <= max_h. None if it never fits."""
+        fm = QFontMetrics(QFont(self.font_family, pt))
+        pad_x = 2 * self.BOX_PADDING_X
+        pad_y = 2 * self.BOX_PADDING_Y
+
+        def needed_at(w):
+            inner_w = max(1, w - pad_x)
+            bbox = fm.boundingRect(0, 0, inner_w, 0, self.TEXT_FLAGS, text)
+            return (bbox.width() + pad_x, bbox.height() + pad_y)
+
+        return self._smallest_fitting_width(
+            needed_at, max(1, min_w), max_w, max_h,
+        )
+
+    @staticmethod
+    def _centered_on(box, w, h):
+        """A (x1, y1, x2, y2) rect of size w x h sharing `box`'s center."""
+        x1, y1, x2, y2 = box
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        nx, ny = cx - w // 2, cy - h // 2
+        return (nx, ny, nx + w, ny + h)
 
     def _layout_in_textbox(self, idx, blk):
         """Original text-bbox layout: top-left aligned, expand into free
@@ -191,17 +309,30 @@ class ResultOverlay(QWidget):
                 break
 
         if not found:
+            # The room between neighbours isn't enough at any font size. Spill
+            # past them — bounded by the captured region — instead of shrinking
+            # to the minimum and clipping. Overlapping a neighbour still reads;
+            # truncated text does not.
+            cap_w, cap_h = self._orig_capture_size
+            for pt in range(self.max_font_pt, self.MIN_FONT_PT - 1, -1):
+                fitted = self._fit_in_expanded_box(
+                    blk.translation, pt, bw, cap_w, cap_h,
+                )
+                if fitted is not None:
+                    chosen_pt = pt
+                    chosen_w, chosen_h = fitted
+                    found = True
+                    break
+
+        if not found:
+            # Needs more than the whole region even at the minimum font.
             chosen_pt = self.MIN_FONT_PT
-            fm = QFontMetrics(QFont(self.font_family, self.MIN_FONT_PT))
-            needed = fm.boundingRect(
-                0, 0, max(1, max_w - 2 * self.BOX_PADDING_X), 0,
-                self.TEXT_FLAGS, blk.translation,
-            )
-            chosen_w = max_w
-            chosen_h = max(bh, needed.height() + 2 * self.BOX_PADDING_Y)
+            nw, nh = self._needed_size(blk.translation, self.MIN_FONT_PT, cap_w)
+            chosen_w = max(bw, nw)
+            chosen_h = max(bh, nh)
 
         return {
-            'rect': (x1, y1, x1 + chosen_w, y1 + chosen_h),
+            'rect': self._clamp_to_region((x1, y1, x1 + chosen_w, y1 + chosen_h)),
             'font_pt': chosen_pt,
             'align': self.TEXT_FLAGS,
         }
@@ -433,11 +564,8 @@ class ResultOverlay(QWidget):
         # of the unmodified screen content.
         inpaint_mode = self._background_pixmap is not None
         if inpaint_mode:
-            # The inpainted image matches the ORIGINAL captured region
-            # (capture_xywh's w/h before layout grew the widget). When the
-            # widget grew to accommodate expanded text boxes, the extra
-            # area sits outside the image — we leave it transparent so the
-            # user's screen content shows through there.
+            # The inpainted image matches the captured region, which is also
+            # the widget size, so this covers the whole surface exactly.
             orig_w, orig_h = self._orig_capture_size
             painter.drawPixmap(0, 0, orig_w, orig_h, self._background_pixmap)
 
