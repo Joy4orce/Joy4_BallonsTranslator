@@ -286,6 +286,21 @@ class TranslationPipeline:
                 inpaint_mask = cv2.dilate(mask, element)
                 inpainted_img = self._inpainter.inpaint(img, inpaint_mask, blk_list)
 
+                # Confine the result to the mask. The inpainter rewrites far
+                # more than it was asked to — measured at 12.4% of the page for
+                # a 0.4% mask — because it writes back whole enlarged crops per
+                # block and, on a flat balloon, floods the balloon with its
+                # average colour. Either way the untouched artwork comes back
+                # resampled or flattened, which drains the contrast out of line
+                # art and reads as a washed-out, over-bright page. Compositing
+                # here keeps every unmasked pixel bit-exact, so whatever the
+                # inpainter does outside the mask stops mattering.
+                if inpainted_img is not None and inpainted_img.shape == img.shape:
+                    keep = (inpaint_mask >= 127)
+                    if keep.ndim == 2:
+                        keep = keep[:, :, None]
+                    inpainted_img = np.where(keep, inpainted_img, img)
+
                 # How much of the page the inpainter actually rewrote. The
                 # detector can produce a very broad mask on sketchy or
                 # low-contrast art, and then the model repaints most of the
