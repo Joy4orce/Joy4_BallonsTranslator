@@ -41,6 +41,43 @@ _RE_THINK_BLOCK = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# A double-quoted chunk, honouring backslash escapes.
+_RE_QUOTED_CHUNK = re.compile(r'"((?:[^"\\]|\\.)*)"', re.DOTALL)
+
+
+def _parse_loose_quoted_list(text: str) -> List[str]:
+    """Salvage quoted chunks that aren't valid JSON at all.
+
+    Models often put the separating comma INSIDE the quote and then drop it
+    between entries — `"응," "야!", "진짜!"` — which no amount of bracket
+    wrapping makes parseable. Recover the entries only when the WHOLE
+    response is quoted chunks joined by nothing but whitespace and commas,
+    so a prose reply still fails loudly instead of being mined for quotes.
+
+    The chunk contents are kept verbatim: a comma inside the quotes may be
+    real punctuation, and guessing which ones were meant as separators would
+    silently corrupt the translation.
+    """
+    chunks = list(_RE_QUOTED_CHUNK.finditer(text))
+    if not chunks:
+        return None
+    pos = 0
+    for m in chunks:
+        if text[pos:m.start()].strip(' \t\r\n,'):
+            return None
+        pos = m.end()
+    if text[pos:].strip(' \t\r\n,'):
+        return None
+
+    out = []
+    for m in chunks:
+        body = m.group(1)
+        try:
+            out.append(str(json.loads('"' + body + '"')))
+        except json.JSONDecodeError:
+            out.append(body)
+    return out
+
 
 def _parse_json_array(text: str) -> List[str]:
     cleaned = _RE_THINK_BLOCK.sub("", text)
@@ -54,6 +91,10 @@ def _parse_json_array(text: str) -> List[str]:
             for key in ("translations", "lines", "result", "items"):
                 if key in data and isinstance(data[key], list):
                     return [str(x) for x in data[key]]
+        if isinstance(data, str):
+            # Single-entry batch: the model answered `"translated"` with no
+            # array around it. The caller's length check validates this.
+            return [data]
     except json.JSONDecodeError:
         pass
     # 2) Embedded array — the model wrapped the array in prose.
@@ -77,7 +118,8 @@ def _parse_json_array(text: str) -> List[str]:
                 return [str(x) for x in data]
         except json.JSONDecodeError:
             pass
-    return None
+    # 4) Not JSON at all — bare quoted chunks, separators misplaced or absent.
+    return _parse_loose_quoted_list(cleaned)
 
 
 @register_translator('Local LLM')
@@ -268,7 +310,8 @@ class LocalLLMTranslator(BaseTranslator):
                 return parsed
             last_err = (
                 f"unparseable or length-mismatched response "
-                f"(got {len(parsed) if parsed else 'None'} for {len(src_list)})"
+                f"(got {len(parsed) if parsed is not None else 'None'} "
+                f"for {len(src_list)})"
             )
             self.logger.warning(
                 f"Local LLM {last_err}. Raw[:300]={raw[:300]!r}. "
