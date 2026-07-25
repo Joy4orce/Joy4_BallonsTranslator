@@ -355,6 +355,11 @@ class ScreenTranslatorApp(QObject):
         print(f'[screen_translator] capture: virtual=({x},{y}) {w}x{h}  '
               f'image={img.shape}')
 
+        # grabWindow() returns PHYSICAL pixels for a LOGICAL rect, so on a
+        # HiDPI screen this is larger than (w, h). The overlay needs it to map
+        # pipeline block coords back into its own logical geometry.
+        self._capture_img_size = (img.shape[1], img.shape[0])
+
         # Re-read BT's config.json on every capture so settings changed in the
         # main app (translator switch, language pair, API key, etc.) take
         # effect immediately without restarting this process. Resolve happens
@@ -460,6 +465,7 @@ class ScreenTranslatorApp(QObject):
             blocks=blocks,
             capture_xywh=capture_xywh,
             inpainted_img=inpainted_img,
+            source_size=getattr(self, '_capture_img_size', None),
             auto_dismiss_ms=settings.overlay_auto_dismiss_ms,
             box_opacity=settings.overlay_box_opacity,
             font_family=settings.overlay_font_family,
