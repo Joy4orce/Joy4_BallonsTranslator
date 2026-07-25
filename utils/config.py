@@ -192,15 +192,20 @@ def load_config():
     pcfg = config
 
     p = pcfg.text_styles_path
-    if not osp.exists(pcfg.text_styles_path):
+    if not osp.exists(p):
         dp = osp.join(shared.DEFAULT_TEXTSTYLE_DIR, 'default.json')
         if p != dp and osp.exists(dp):
-            p = dp
             LOGGER.warning(f'Text style {p} does not exist, use the default from {dp}.')
         else:
             with open(dp, 'w', encoding='utf8') as f:
                 f.write(json.dumps([],  ensure_ascii=False))
             LOGGER.info(f'New text style file created at {dp}.')
+        # Load the default in both branches. Falling through with the missing
+        # path makes load_textstyle_from() bail early, which leaves
+        # pcfg.text_styles_path pointing at the dead location (it is only
+        # updated on a successful load) so save_text_styles() would then
+        # recreate that directory and write the styles out of tree.
+        p = dp
     load_textstyle_from(p)
 
 def save_config():
