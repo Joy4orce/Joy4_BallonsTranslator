@@ -795,6 +795,11 @@ class SceneTextManager(QObject):
         if restore_charfmts:
             self.restore_charfmts(blkitem, text, new_text, char_fmts)
         blkitem.shrinkSize()
+        # shrinkSize() settles the final geometry, so clamp after it: a box that
+        # grew past the image edge is slid back on-page rather than left to be
+        # cropped by render_result_img() on export.
+        im_h, im_w = img.shape[:2]
+        blkitem.keepInsidePage(im_w, im_h)
         return True
     
     def restore_charfmts(self, blkitem: TextBlkItem, text: str, new_text: str, char_fmts: List[QTextCharFormat]):
