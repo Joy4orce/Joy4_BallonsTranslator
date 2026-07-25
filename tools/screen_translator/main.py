@@ -531,7 +531,62 @@ class ScreenTranslatorApp(QObject):
 
 # ── Entry point ─────────────────────────────────────────────────────────────
 
+class _Tee:
+    """Write to several streams at once, flushing each line immediately.
+
+    Diagnosing this tool has twice been blocked by its output living only in
+    the console window of whoever launched it: close the window and the
+    evidence is gone, and it cannot be read from anywhere else. Mirroring
+    stdout/stderr to a file keeps the console exactly as it was while leaving
+    something to go back to.
+    """
+
+    def __init__(self, *streams):
+        self._streams = [s for s in streams if s is not None]
+
+    def write(self, data):
+        for s in self._streams:
+            try:
+                s.write(data)
+                s.flush()
+            except Exception:
+                # A broken pipe on one stream must not take the others down.
+                pass
+        return len(data)
+
+    def flush(self):
+        for s in self._streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        return False
+
+
+def _start_logfile():
+    """Mirror stdout/stderr into logs/screen_translator_<timestamp>.log."""
+    import datetime
+
+    log_dir = os.path.join(_ROOT, 'logs')
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        stamp = datetime.datetime.now().strftime('%Y_%m_%d-%H_%M_%S')
+        path = os.path.join(log_dir, f'screen_translator_{stamp}.log')
+        fh = open(path, 'w', encoding='utf-8', buffering=1)
+    except OSError as e:
+        print(f'[screen_translator] could not open a log file ({e}); '
+              f'console only')
+        return
+    sys.stdout = _Tee(sys.stdout, fh)
+    sys.stderr = _Tee(sys.stderr, fh)
+    print(f'[screen_translator] logging to {path}')
+
+
 def main():
+    _start_logfile()
+
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)  # keep running after overlays close
 
