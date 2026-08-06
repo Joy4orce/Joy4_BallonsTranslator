@@ -253,7 +253,13 @@ def prepare_environment():
                 run_pip(f"install {req}", req)
                 req_updated = True
 
-    torch_command = os.environ.get('TORCH_COMMAND', "pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118 --disable-pip-version-check")
+    # cu128, not cu118: Blackwell cards (RTX 50xx) are sm_120, which the cu118
+    # builds do not carry kernels for. They still run there, because the driver
+    # JIT-compiles the bundled compute_37 PTX, but that costs a minute or more
+    # on a cold shader cache and leaves the card's own architecture unused.
+    # onnxruntime-gpu borrows its CUDA DLLs from torch on Windows, so its pin in
+    # requirements.txt has to move with this.
+    torch_command = os.environ.get('TORCH_COMMAND', "pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128 --disable-pip-version-check")
     if args.reinstall_torch or not is_installed("torch") or not is_installed("torchvision"):
         run(f'"{python}" -m {torch_command}', "Installing torch and torchvision", "Couldn't install torch", live=True)
         req_updated = True
