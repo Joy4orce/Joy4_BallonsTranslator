@@ -170,9 +170,11 @@ def build_cases():
     return cases
 
 
-def list_rows(page, origin, rows, glyph=18, leading=5, ink=INK):
+def list_rows(page, origin, rows, glyph=18, leading=5, ink=INK, hollow=False):
     """Draw rows of fake horizontal glyphs. `rows` is a list of (bullet, n):
     whether the row opens with a bullet dot, and how many glyphs it has.
+    `hollow` draws the glyphs as outlines, which leaves the ground the larger
+    part of the block, as it is under real type; solid ones are mostly ink.
     Returns the ink bbox of the whole list."""
     x0, y = origin
     right = x0
@@ -183,7 +185,8 @@ def list_rows(page, origin, rows, glyph=18, leading=5, ink=INK):
             cv2.rectangle(page, (x, cy - 3), (x + 6, cy + 3), ink, -1)
             x += 6 + glyph // 2
         for _ in range(n):
-            cv2.rectangle(page, (x, y), (x + glyph - 4, y + glyph - 1), ink, -1)
+            cv2.rectangle(page, (x, y), (x + glyph - 4, y + glyph - 1), ink,
+                          2 if hollow else -1)
             x += glyph
         right = max(right, x - 4)
         y += glyph + leading
@@ -245,6 +248,7 @@ def main():
     failures += check_shared_balloon(TranslationPipeline)
     failures += check_joined_balloons(TranslationPipeline)
     failures += check_lists(TranslationPipeline)
+    failures += check_text_at_the_edge(TranslationPipeline)
 
     print()
     print('all cases passed' if not failures else f'{failures} case(s) failed')
@@ -420,6 +424,101 @@ def check_lists(pipeline_cls):
     pipe._reread_lists(page2, [para])
     expect('plain paragraph keeps its reading', para.get_text() == '段落として読まれた文字列',
            repr(para.get_text()))
+    return fails
+
+
+def check_text_at_the_edge(pipeline_cls):
+    """Text that vanished: a block overhanging the capture, and a list set on
+    a strip of white across a picture.
+
+    The detector gave a list hard against the left of the capture a box
+    starting at x = -8. The OCR modules skip a box that is not strictly inside
+    the image and leave its text empty, so nothing was translated — and the
+    inpainter erased the original all the same. The capture came back with the
+    list simply gone.
+    """
+    from utils.textblock import TextBlock
+
+    fails = 0
+
+    def expect(label, cond, detail):
+        nonlocal fails
+        fails += 0 if cond else 1
+        print(f'{"PASS" if cond else "FAIL"}  {label:36} {detail}')
+
+    def block(xyxy, text='', translation=''):
+        b = TextBlock()
+        b.xyxy = list(xyxy)
+        b.vertical = False
+        b.text = text
+        b.translation = translation
+        return b
+
+    def strictly_inside(b, img):
+        # The condition in modules/ocr/__init__.py, _ocr_blk_list.
+        h, w = img.shape[:2]
+        x1, y1, x2, y2 = b.xyxy
+        return 0 < x1 < x2 < w and 0 < y1 < y2 < h
+
+    page = np.full((400, 600, 3), 222, np.uint8)
+    left, corner, inside = block((-8, 300, 200, 360)), block((500, 380, 640, 420)), \
+        block((50, 50, 150, 90))
+    pipeline_cls._clamp_blocks_to_image(page, [left, corner, inside])
+    expect('overhanging block pulled inside', strictly_inside(left, page)
+           and strictly_inside(corner, page), f'{left.xyxy} {corner.xyxy}')
+    expect('block already inside untouched', list(inside.xyxy) == [50, 50, 150, 90],
+           str(inside.xyxy))
+
+    # No translation, no erasing. The untranslated block overlaps a translated
+    # one: where they overlap the translated block's text must still go.
+    mask = np.zeros((400, 600), np.uint8)
+    lost = block((40, 40, 200, 120), 'よめた', '')
+    kept = block((180, 100, 400, 160), 'よめた', '번역')
+    for b in (lost, kept):
+        x1, y1, x2, y2 = b.xyxy
+        mask[y1:y2, x1:x2] = 255
+    to_erase, spared = pipeline_cls._spare_untranslated(mask, [lost, kept])
+    expect('untranslated block is not erased',
+           spared == 1 and len(to_erase) == 1 and to_erase[0] is kept
+           and not mask[40:100, 40:180].any(), f'spared {spared}')
+    expect('translated neighbour still erased', bool(mask[100:160, 180:400].all()),
+           f'{int((mask[100:160, 180:400] > 0).mean() * 100)}% of its mask left')
+
+    # A list on its own strip of white across a dark picture, hard against the
+    # left edge. Outside the block is the picture, so the ground has to be
+    # found inside it; the picture beside the shorter rows is not ink. The
+    # first item wraps: its second row has no bullet and belongs to it.
+    spec = [(True, 16), (False, 9), (True, 14), (True, 7)]
+    picture = np.full((300, 500, 3), 84, np.uint8)
+    cv2.circle(picture, (420, 120), 25, (250, 250, 250), -1)    # a highlight in it
+    glyph, leading, x0, y0 = 18, 5, 6, 150
+    y = y0
+    for bullet, n in spec:
+        width = n * glyph + (6 + glyph // 2 if bullet else 0)
+        cv2.rectangle(picture, (0, y - 3), (x0 + width + 2, y + glyph + 2),
+                      (255, 255, 255), -1)
+        y += glyph + leading
+    box = list_rows(picture, (x0, y0), spec, glyph=glyph, leading=leading,
+                    ink=(0, 0, 0), hollow=True)
+    text_mask = cv2.dilate((cv2.cvtColor(picture, cv2.COLOR_RGB2GRAY) < 40)
+                           .astype(np.uint8) * 255, np.ones((5, 5), np.uint8))
+
+    rows, paper = pipeline_cls._find_rows(picture, box, text_mask)
+    expect('rows found on a strip over a picture',
+           rows is not None and len(rows) == len(spec) and paper > 200,
+           f'{None if rows is None else len(rows)} of {len(spec)}, ground {paper}')
+
+    class StubOCR:
+        def ocr_img(self, img):
+            return 'テキスト'
+
+    pipe = pipeline_cls.__new__(pipeline_cls)
+    pipe._ocr = StubOCR()
+    lst = block(box, '一塊に読まれた文字列')
+    pipe._reread_lists(picture, [lst], text_mask)
+    lines = lst.get_text().split('\n')
+    expect('wrapped row joined to its item',
+           lines == ['・テキストテキスト', '・テキスト', '・テキスト'], repr(lines))
     return fails
 
 
