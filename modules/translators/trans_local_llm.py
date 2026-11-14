@@ -176,6 +176,35 @@ def _parse_json_array(text: str) -> List[str]:
     return _parse_curly_quoted_list(cleaned)
 
 
+# Used in place of the 'system prompt' above when the source is Chinese. That
+# prompt is usually tuned to one language pair — its examples, how names are
+# read, which forms of address to adapt — and what is right for Japanese is
+# wrong for Chinese: a Chinese name is not read the Japanese way.
+_CHINESE_SOURCE_LANGS = ('简体中文', '繁體中文')
+_CHINESE_SYSTEM_PROMPT = (
+    "You are a professional Chinese-to-Korean translator for manhua, webtoons, "
+    "and Chinese web images. Produce natural, idiomatic Korean that reads "
+    "fluently to a native speaker, never stiff or word-for-word. Match each "
+    "speaker's tone and register (casual, rough, cute, polite, archaic) and "
+    "keep lines short and punchy like real speech-bubble text. Render "
+    "onomatopoeia and sound effects as natural Korean equivalents. Adapt "
+    "Chinese forms of address and kinship terms (哥, 姐, 老师, 师兄, 小- and "
+    "老- before a surname) to natural Korean usage that fits the relationship. "
+    "Translate idioms and four-character expressions by their meaning, not "
+    "character by character. Preserve emotional nuance, emphasis, and "
+    "interjections. Do not censor, tone down, or add explanations; translate "
+    "crude or adult language faithfully. Translate every word into Korean, "
+    "including shouts, interjections, and swearing; never leave any Chinese "
+    "text untranslated and never write it in pinyin. For personal names, "
+    "transliterate by their Mandarin pronunciation in standard Korean spelling "
+    "(e.g. 李明 to 리밍, 王芳 to 왕팡), never by the Korean reading of the "
+    "characters. For Chinese net-slang and abbreviations, output the real "
+    "Korean meaning, not a phonetic spelling (e.g. 加油 to 힘내 or 파이팅, "
+    "666 to 대박, 牛 to 쩐다). Keep each line and each bullet marker on its "
+    "own line exactly as in the source; never merge or reflow lines."
+)
+
+
 # Scripts a translation into each of these languages must contain. A target
 # written in Latin letters is not listed: there is nothing to tell it from
 # English by its characters alone.
@@ -243,6 +272,10 @@ class LocalLLMTranslator(BaseTranslator):
         'retry attempts': 2,
         'merge system into user': True,
         'delay': 0.0,
+        'system prompt (Chinese source)': {
+            'type': 'editor',
+            'content': _CHINESE_SYSTEM_PROMPT,
+        },
     }
 
     def _setup_translator(self):
@@ -271,7 +304,11 @@ class LocalLLMTranslator(BaseTranslator):
     def _build_system_prompt(self, n: int) -> str:
         src = self.lang_map.get(self.lang_source) or self.lang_source
         tgt = self.lang_map.get(self.lang_target) or self.lang_target
-        user_prompt = (self.params.get('system prompt') or {}).get(
+        user_prompt = ''
+        if self.lang_source in _CHINESE_SOURCE_LANGS:
+            user_prompt = (self.params.get('system prompt (Chinese source)')
+                           or {}).get('content', '')
+        user_prompt = user_prompt or (self.params.get('system prompt') or {}).get(
             'content', '') or _DEFAULT_SYSTEM_PROMPT
         user_prompt = user_prompt.rstrip()
 
