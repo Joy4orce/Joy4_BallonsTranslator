@@ -243,11 +243,97 @@ def main():
         print(f'{"PASS" if ok else "FAIL"}  {case["name"]:36} {detail}')
 
     failures += check_shared_balloon(TranslationPipeline)
+    failures += check_joined_balloons(TranslationPipeline)
     failures += check_lists(TranslationPipeline)
 
     print()
     print('all cases passed' if not failures else f'{failures} case(s) failed')
     return 1 if failures else 0
+
+
+def joined_frames(bridged):
+    """Two caption frames whose insides are one patch of paper.
+
+    Plain: drawn overlapping at a corner, the way a second balloon is tucked
+    against the first. `bridged`: set well apart on a diagonal and connected by
+    a narrow neck, the other common way of drawing a continued line — and one
+    that leaves most of the box around the pair empty.
+    Returns (page, upper text bbox, lower text bbox)."""
+    page = new_page(600, 700, busy=False)
+    if bridged:
+        upper, lower = (340, 60, 480, 300), (130, 380, 270, 620)
+    else:
+        upper, lower = (300, 60, 460, 360), (150, 320, 330, 600)
+    for f in (upper, lower):                            # outlines first...
+        cv2.rectangle(page, f[:2], f[2:], (0, 0, 0), 2)
+    if bridged:
+        cv2.line(page, (345, 295), (265, 385), (0, 0, 0), 20)
+        cv2.line(page, (345, 295), (265, 385), (255, 255, 255), 14)
+    for f in (upper, lower):                            # ...then open the join
+        cv2.rectangle(page, (f[0] + 2, f[1] + 2), (f[2] - 2, f[3] - 2), (255, 255, 255), -1)
+    text_up = vertical_text(page, (upper[0], upper[1] + 20, upper[2], upper[3] - 20), 3)
+    text_low = vertical_text(page, (lower[0], lower[1] + 20, lower[2], lower[3] - 20), 3)
+    return page, text_up, text_low
+
+
+def check_joined_balloons(pipeline_cls):
+    """Two balloons drawn overlapping are one patch of paper.
+
+    Read as one balloon when that works — the pair is solid enough and the text
+    sits in the middle of it — and the two texts are joined and set once. That
+    is the long-standing behaviour and it must not change.
+
+    When it does not work, because the pair leaves too little of the box around
+    it as paper, each text gets its own part of the patch instead. Without that
+    both fall back to their narrow vertical boxes, where horizontal Korean from
+    one runs into the other.
+    """
+    from tools.screen_translator.pipeline import TranslatedBlock
+
+    fails = 0
+
+    def expect(label, cond, detail):
+        nonlocal fails
+        fails += 0 if cond else 1
+        print(f'{"PASS" if cond else "FAIL"}  {label:36} {detail}')
+
+    def merged_count(texts, balloons):
+        blocks = [TranslatedBlock(t, 0.0, 's', 'x', b) for t, b in zip(texts, balloons)]
+        return len(pipeline_cls._merge_blocks_sharing_balloon(blocks, rtl=True))
+
+    # Solid pair: one balloon, as before.
+    page, text_up, text_low = joined_frames(bridged=False)
+    reasons = []
+    up, low = pipeline_cls._assign_balloons(page, [text_up, text_low], reasons)
+    expect('solid pair: read as one balloon', up is not None and up == low,
+           f'{up} / {low} {reasons}')
+    if up is not None and low is not None:
+        expect('solid pair: texts joined', merged_count([text_up, text_low], [up, low]) == 1,
+               'one block')
+
+    # Sparse pair: a part each.
+    page, text_up, text_low = joined_frames(bridged=True)
+    reasons = []
+    up, low = pipeline_cls._assign_balloons(page, [text_up, text_low], reasons)
+    expect('sparse pair: both found', up is not None and low is not None,
+           f'{up} / {low} {reasons}')
+    if up is None or low is None:
+        return fails
+    expect('sparse pair: a part each', pipeline_cls._iou(up, low) < 0.3,
+           f'IoU {pipeline_cls._iou(up, low):.2f}')
+
+    def holds(rect, box):
+        return rect[0] <= box[0] and rect[1] <= box[1] and rect[2] >= box[2] and rect[3] >= box[3]
+
+    expect('sparse pair: each part holds its text',
+           holds(up, text_up) and holds(low, text_low)
+           and not holds(up, text_low) and not holds(low, text_up), f'{up} / {low}')
+    expect('sparse pair: text centred in its part',
+           pipeline_cls._text_is_centered(up, text_up)
+           and pipeline_cls._text_is_centered(low, text_low), f'{up} / {low}')
+    expect('sparse pair: texts stay separate',
+           merged_count([text_up, text_low], [up, low]) == 2, 'two blocks')
+    return fails
 
 
 def check_lists(pipeline_cls):
