@@ -11,6 +11,8 @@ dismisses; optional auto-timeout.
 from dataclasses import replace
 from typing import List, Optional
 
+import math
+
 import numpy as np
 from qtpy.QtCore import Qt, QRect, QTimer, Signal
 from qtpy.QtGui import (
@@ -184,7 +186,26 @@ class ResultOverlay(QWidget):
                     int(round(x2 * sx)), int(round(y2 * sy)))
 
         return [replace(b, xyxy=rescale(b.xyxy),
-                        balloon_xyxy=rescale(b.balloon_xyxy)) for b in blocks]
+                        balloon_xyxy=rescale(b.balloon_xyxy),
+                        font_px=getattr(b, 'font_px', 0.0) * sy) for b in blocks]
+
+    # How much larger than the original glyphs a translation may be set.
+    SOURCE_SIZE_SLACK = 1.25
+
+    def _max_pt_for(self, blk):
+        """Largest font size to try for this block.
+
+        The configured maximum, unless the original text was smaller than
+        that: then its own size, with a little slack. Small print — chat
+        bubbles, timestamps, captions — set at the full size cannot fit where
+        it came from, spills, and ends up drawn over its neighbours.
+        """
+        px = getattr(blk, 'font_px', 0.0) or 0.0
+        if px <= 0:
+            return self.max_font_pt
+        # Glyph height in (logical) pixels to points: 96 dpi, 72 points an inch.
+        pt = int(math.ceil(px * 0.75 * self.SOURCE_SIZE_SLACK))
+        return max(self.MIN_FONT_PT, min(self.max_font_pt, pt))
 
     def _clamp_to_region(self, rect):
         """Slide `rect` (x1, y1, x2, y2) back inside the captured region.
@@ -219,19 +240,20 @@ class ResultOverlay(QWidget):
         """Fit the translation to the balloon, centered.
 
         Readability order: fill the balloon at the largest font that fits →
-        spill outside the balloon rather than shrink further → shrink only when
-        even the region has no room. Showing all of the text matters more than
-        respecting the balloon outline, so the box is allowed to grow past it;
-        what is never acceptable is text clipped away where the balloon still
-        looks half empty.
+        spill outside it, by as little as will do (see _spill) → only when even
+        the region has no room, the minimum font and whatever shows. Showing
+        all of the text matters more than respecting the balloon outline, so
+        the box is allowed to grow past it; what is never acceptable is text
+        clipped away where the balloon still looks half empty.
         """
         bx1, by1, bx2, by2 = [int(v) for v in balloon]
         bw = max(1, bx2 - bx1)
         bh = max(1, by2 - by1)
         cap_w, cap_h = self._orig_capture_size
+        top_pt = self._max_pt_for(blk)
 
         # 1) Largest font whose wrapped text fits the balloon untouched.
-        for pt in range(self.max_font_pt, self.MIN_FONT_PT - 1, -1):
+        for pt in range(top_pt, self.MIN_FONT_PT - 1, -1):
             nw, nh = self._needed_size(blk.translation, pt, bw)
             if nw <= bw and nh <= bh:
                 return {
@@ -240,21 +262,17 @@ class ResultOverlay(QWidget):
                     'align': self.ALIGN_CENTER,
                 }
 
-        # 2) Too small at every font size. Keep the font as large as possible
-        #    and let the box spill outside the balloon instead, bounded by the
-        #    captured region, centered so the text stays visually attached.
-        for pt in range(self.max_font_pt, self.MIN_FONT_PT - 1, -1):
-            fitted = self._fit_in_expanded_box(
-                blk.translation, pt, bw, cap_w, cap_h,
-            )
-            if fitted is not None:
-                w, h = fitted
-                return {
-                    'rect': self._clamp_to_region(
-                        self._centered_on(balloon, max(bw, w), max(bh, h))),
-                    'font_pt': pt,
-                    'align': self.ALIGN_CENTER,
-                }
+        # 2) Too small at every font size. Let the box spill outside the
+        #    balloon, centered so the text stays visually attached.
+        spilled = self._spill(blk.translation, top_pt, bw, bh)
+        if spilled is not None:
+            pt, w, h = spilled
+            return {
+                'rect': self._clamp_to_region(
+                    self._centered_on(balloon, max(bw, w), max(bh, h))),
+                'font_pt': pt,
+                'align': self.ALIGN_CENTER,
+            }
 
         # 3) Even the minimum font needs more than the whole region. Take its
         #    natural size so as much as possible shows; the clamp trims the
@@ -266,6 +284,35 @@ class ResultOverlay(QWidget):
             'font_pt': self.MIN_FONT_PT,
             'align': self.ALIGN_CENTER,
         }
+
+    # How far past its box a translation may reach, tried in this order: the
+    # box grown by each factor in both directions.
+    SPILL_STEPS = (1.25, 1.5, 2.0, 3.0, 4.0, 6.0, 10.0)
+
+    def _spill(self, text, top_pt, bw, bh):
+        """The smallest overflow of a bw x bh box that shows all of `text`:
+        (font_pt, w, h), or None when even the whole region is too small.
+
+        The box grows a step at a time, in both directions, keeping its shape,
+        and at each step the largest font that fits is taken. A little over the
+        edge at a smaller size comes before a lot over it at a larger one.
+
+        It used to be the other way round: the largest font, in the narrowest
+        box that fit anywhere in the capture. For a small balloon that is a
+        column of large type as wide as the balloon running down the page, over
+        everything below it — a row of chat bubbles came out as one heap.
+        """
+        cap_w, cap_h = self._orig_capture_size
+        for k in self.SPILL_STEPS:
+            max_w = min(cap_w, int(math.ceil(bw * k)))
+            max_h = min(cap_h, int(math.ceil(bh * k)))
+            for pt in range(top_pt, self.MIN_FONT_PT - 1, -1):
+                fitted = self._fit_in_expanded_box(text, pt, bw, max_w, max_h)
+                if fitted is not None:
+                    return (pt, fitted[0], fitted[1])
+            if max_w >= cap_w and max_h >= cap_h:
+                break
+        return None
 
     def _fit_in_expanded_box(self, text, pt, min_w, max_w, max_h):
         """Smallest (w, h) that holds `text` at font `pt`, searching widths in
@@ -301,11 +348,12 @@ class ResultOverlay(QWidget):
         max_right, max_bottom = self._expansion_bounds(idx)
         max_w = max(bw, max_right - x1)
         max_h = max(bh, max_bottom - y1)
+        top_pt = self._max_pt_for(blk)
 
         chosen_pt = self.MIN_FONT_PT
         chosen_w, chosen_h = bw, bh
         found = False
-        for pt in range(self.max_font_pt, self.MIN_FONT_PT - 1, -1):
+        for pt in range(top_pt, self.MIN_FONT_PT - 1, -1):
             result = self._try_fit_at_font(
                 blk.translation, pt, bw, bh, max_w, max_h,
             )
@@ -315,21 +363,16 @@ class ResultOverlay(QWidget):
                 found = True
                 break
 
+        cap_w, cap_h = self._orig_capture_size
         if not found:
             # The room between neighbours isn't enough at any font size. Spill
-            # past them — bounded by the captured region — instead of shrinking
-            # to the minimum and clipping. Overlapping a neighbour still reads;
-            # truncated text does not.
-            cap_w, cap_h = self._orig_capture_size
-            for pt in range(self.max_font_pt, self.MIN_FONT_PT - 1, -1):
-                fitted = self._fit_in_expanded_box(
-                    blk.translation, pt, bw, cap_w, cap_h,
-                )
-                if fitted is not None:
-                    chosen_pt = pt
-                    chosen_w, chosen_h = fitted
-                    found = True
-                    break
+            # past them — bounded by the captured region, and by as little as
+            # will do — instead of clipping. Overlapping a neighbour still
+            # reads; truncated text does not.
+            spilled = self._spill(blk.translation, top_pt, bw, bh)
+            if spilled is not None:
+                chosen_pt, chosen_w, chosen_h = spilled
+                found = True
 
         if not found:
             # Needs more than the whole region even at the minimum font.
@@ -614,13 +657,23 @@ class ResultOverlay(QWidget):
             f = QFont(self.font_family, item['font_pt'])
             f.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
             painter.setFont(f)
+            text_rect = rect.adjusted(self.BOX_PADDING_X, self.BOX_PADDING_Y,
+                                      -self.BOX_PADDING_X, -self.BOX_PADDING_Y)
+            align = item.get('align', self.TEXT_FLAGS)
+            if inpaint_mode:
+                # A light edge round every glyph. Inside a balloon it cannot be
+                # seen; where the original stood on a strip of white laid over
+                # the picture, that strip was erased along with the text, and
+                # dark type straight on a dark picture is not readable.
+                r = 1 if item['font_pt'] < 12 else 2
+                painter.setPen(QColor(255, 255, 255))
+                for dx in range(-r, r + 1):
+                    for dy in range(-r, r + 1):
+                        if dx or dy:
+                            painter.drawText(text_rect.translated(dx, dy), align,
+                                             blk.translation)
             painter.setPen(QColor(20, 20, 20))
-            painter.drawText(
-                rect.adjusted(self.BOX_PADDING_X, self.BOX_PADDING_Y,
-                              -self.BOX_PADDING_X, -self.BOX_PADDING_Y),
-                item.get('align', self.TEXT_FLAGS),
-                blk.translation,
-            )
+            painter.drawText(text_rect, align, blk.translation)
 
         # Tiny dismiss hint in the corner so first-time users know how to
         # close it (and that right-click copies). Skipped entirely when a
