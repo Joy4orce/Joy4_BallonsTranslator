@@ -345,7 +345,74 @@ class TranslationPipeline:
                 translation=tr,
                 balloon_xyxy=balloon_xyxy,
             ))
+
+        if self._current.fill_balloon:
+            from modules.translators.base import RTL_SOURCE_LANGS
+            out = self._merge_blocks_sharing_balloon(
+                out, rtl=self._current.source_lang in RTL_SOURCE_LANGS)
         return out, inpainted_img
+
+    @staticmethod
+    def _merge_blocks_sharing_balloon(blocks, rtl):
+        """Fold blocks that landed in the same balloon into one.
+
+        The detector often splits one balloon's text into several blocks — two
+        paragraphs side by side, a line set apart from the rest. Each of them
+        is then handed the same balloon, and the overlay fills that balloon
+        with each translation separately, centered: every one drawn straight
+        over the others. A balloon is one flow of text, so its blocks are
+        joined in reading order and laid out once.
+
+        Balloons count as the same above 0.8 IoU rather than only when
+        identical, since two blocks can sample slightly different paper levels
+        and come back a pixel or two apart. Blocks without a balloon are left
+        alone; order of the list is otherwise preserved.
+        """
+        from modules.translators.base import reading_order_indices
+
+        def iou(a, b):
+            ix = min(a[2], b[2]) - max(a[0], b[0])
+            iy = min(a[3], b[3]) - max(a[1], b[1])
+            if ix <= 0 or iy <= 0:
+                return 0.0
+            inter = ix * iy
+            union = ((a[2] - a[0]) * (a[3] - a[1])
+                     + (b[2] - b[0]) * (b[3] - b[1]) - inter)
+            return inter / union if union > 0 else 0.0
+
+        groups = []
+        for blk in blocks:
+            if blk.balloon_xyxy is not None:
+                home = next((g for g in groups
+                             if g[0].balloon_xyxy is not None
+                             and iou(g[0].balloon_xyxy, blk.balloon_xyxy) >= 0.8),
+                            None)
+                if home is not None:
+                    home.append(blk)
+                    continue
+            groups.append([blk])
+
+        merged = []
+        for group in groups:
+            if len(group) == 1:
+                merged.append(group[0])
+                continue
+            members = [group[k] for k in reading_order_indices(group, rtl)]
+            merged.append(TranslatedBlock(
+                xyxy=(min(m.xyxy[0] for m in members), min(m.xyxy[1] for m in members),
+                      max(m.xyxy[2] for m in members), max(m.xyxy[3] for m in members)),
+                angle=members[0].angle,
+                source_text='\n'.join(m.source_text for m in members if m.source_text),
+                translation='\n'.join(m.translation for m in members
+                                      if m.translation.strip()),
+                balloon_xyxy=(min(m.balloon_xyxy[0] for m in members),
+                              min(m.balloon_xyxy[1] for m in members),
+                              max(m.balloon_xyxy[2] for m in members),
+                              max(m.balloon_xyxy[3] for m in members)),
+            ))
+            print(f'[screen_translator] merged {len(members)} blocks sharing '
+                  f'one balloon')
+        return merged
 
     # Balloon search tuning. See _compute_balloon_xyxy.
     _BALLOON_PADS = (1.0, 2.0)       # crop margin, in multiples of the text's long side
