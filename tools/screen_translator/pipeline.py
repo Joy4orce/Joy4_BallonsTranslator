@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import copy
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -262,6 +263,13 @@ class TranslationPipeline:
         _emit(f'OCR ({len(blk_list)} blocks)...')
         t0 = time.time()
         self._ocr.run_ocr(img, blk_list)
+        try:
+            self._reread_lists(img, blk_list)
+        except Exception as e:
+            # Purely an improvement over the block-level read; never let it
+            # take the capture down.
+            print(f'[screen_translator] list re-read skipped '
+                  f'({type(e).__name__}: {e})')
         t_ocr = time.time() - t0
 
         _emit(f'Translating ({len(blk_list)} blocks)...')
@@ -414,13 +422,281 @@ class TranslationPipeline:
                   f'one balloon')
         return merged
 
+    # Characters that open a list item. A horizontal block with a row starting
+    # on one of these is a list: its rows are content, not line wrapping.
+    _LIST_MARKERS = '・･•●○◆◇■□▶▷※＊*-‐–'
+    _RE_NUMBERED_ITEM = re.compile(r'^(?:[①-⑳]|[(（]?\d{1,2}[.)）])')
+
+    @classmethod
+    def _is_list_item(cls, text):
+        text = text.lstrip()
+        return bool(text) and (text[0] in cls._LIST_MARKERS
+                               or cls._RE_NUMBERED_ITEM.match(text) is not None)
+
+    @staticmethod
+    def _split_rows(img, box):
+        """Split a horizontal text block into its rows by where the ink is.
+
+        Returns one (x1, y1, x2, y2) per row, top to bottom, or None when the
+        block does not separate cleanly into two or more rows.
+
+        The detector's own line polygons are not usable for this: on a profile
+        card they came back as one polygon covering most of the block plus a few
+        partial ones, with a whole row missing. A projection of the ink onto the
+        vertical axis is crude but dependable for what it is needed for — text
+        set in rows on a plain ground. Over artwork the "ink" is everything and
+        the rows come out irregular, which is caught and refused.
+        """
+        cls = TranslationPipeline
+        ih, iw = img.shape[:2]
+        x1, y1, x2, y2 = [int(v) for v in box]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(iw, x2), min(ih, y2)
+        w, h = x2 - x1, y2 - y1
+        if w < 8 or h < 8:
+            return None
+
+        paper, _ = cls._paper_level(img, (x1, y1, x2, y2))
+        crop = cls._grey(img[y1:y2, x1:x2]).astype(np.int16)
+        ink = np.abs(crop - paper) > cls._BALLOON_TOL
+        # A row of text against the gap between two rows, judged relative to
+        # how much ink a text row carries here. The gap is not reliably empty:
+        # with tight leading a bracket or a dakuten reaches into it, and a
+        # capture scaled by the display blurs the edges across it. Asking for
+        # zero ink welds the whole block into one row.
+        profile = ink.sum(axis=1)
+        busy = float(np.percentile(profile, 90))
+        if busy < 2:
+            return None
+        has_ink = profile >= max(2.0, 0.15 * busy)
+
+        runs, start = [], None
+        for y, flag in enumerate(has_ink):
+            if flag and start is None:
+                start = y
+            elif not flag and start is not None:
+                runs.append([start, y])
+                start = None
+        if start is not None:
+            runs.append([start, h])
+        if len(runs) < 2:
+            return None
+
+        heights = sorted(e - s for s, e in runs)
+        typical = heights[len(heights) // 2]
+
+        # A sliver of a gap, or a short run next to a full one (dakuten that
+        # cleared the line, a ruby line), belongs to its neighbour.
+        rows = [runs[0]]
+        for s, e in runs[1:]:
+            gap = s - rows[-1][1]
+            short = min(e - s, rows[-1][1] - rows[-1][0]) < 0.4 * typical
+            if gap <= max(1, 0.15 * typical) or (short and gap <= 0.5 * typical):
+                rows[-1][1] = e
+            else:
+                rows.append([s, e])
+        # Whatever is still much shorter than a row is a stray mark, not text.
+        rows = [r for r in rows if r[1] - r[0] >= 0.35 * typical]
+        if len(rows) < 2:
+            return None
+        if max(e - s for s, e in rows) > 3 * typical:
+            return None         # not rows of text
+
+        pad = 3
+        boxes = []
+        for s, e in rows:
+            cols = np.flatnonzero(ink[s:e].any(axis=0))
+            if cols.size == 0:
+                continue
+            boxes.append((max(0, x1 + int(cols[0]) - pad), max(0, y1 + s - pad),
+                          min(iw, x1 + int(cols[-1]) + 1 + pad), min(ih, y1 + e + pad)))
+        return boxes if len(boxes) >= 2 else None
+
+    def _reread_lists(self, img, blk_list):
+        """Re-read horizontal list blocks one row at a time, keeping the rows.
+
+        The OCR reads a block as a single image and returns a single string. For
+        a balloon that is right — its lines are just wrapping. For a list (a
+        profile card, a spec sheet) the rows ARE the structure: read as one
+        image they come back run together with no breaks, so the translation is
+        one paragraph and nothing downstream can put the items back on their own
+        lines. A six-row block is also well outside what the model reads
+        reliably in one go.
+
+        So each horizontal block is split into rows and the rows read
+        separately; if any row opens with a list marker, the block's text
+        becomes those rows joined by newlines. The translator passes the
+        newlines through and the overlay draws them. A block that is not a list
+        keeps its original reading untouched.
+        """
+        read_row = getattr(self._ocr, 'ocr_img', None)
+        if read_row is None:
+            return
+        ih, iw = img.shape[:2]
+        lists = []          # (block, rows) for every block rewritten as a list
+        for blk in blk_list:
+            if getattr(blk, 'vertical', False):
+                continue
+            rows = self._split_rows(img, blk.xyxy)
+            if not rows or len(rows) > 30:
+                continue
+            bx1, by1, bx2, by2 = [int(v) for v in blk.xyxy]
+            paper, _ = self._paper_level(
+                img, (max(0, bx1), max(0, by1), min(iw, bx2), min(ih, by2)))
+
+            texts = []
+            for rx1, ry1, rx2, ry2 in rows:
+                # A bullet is taken off by shape and the rest read without it.
+                # Left in, the OCR tends to fuse it into the first character
+                # (・シ read as ジ), which loses both the marker and the word.
+                cut = self._leading_bullet_width(img[ry1:ry2, rx1:rx2], paper)
+                t = read_row(self._pad_row(img[ry1:ry2, rx1 + cut:rx2], paper))
+                t = (t if isinstance(t, str) else '').strip()
+                if not t:
+                    continue
+                if cut and not self._is_list_item(t):
+                    t = '・' + t
+                texts.append(t)
+            if len(texts) < 2 or not any(self._is_list_item(t) for t in texts):
+                continue
+            blk.text = '\n'.join(texts)
+            lists.append((blk, len(texts)))
+            print(f'[screen_translator] list block re-read as {len(texts)} rows')
+
+        for lst, n_rows in lists:
+            self._absorb_list_title(blk_list, lst, n_rows)
+
+    @staticmethod
+    def _absorb_list_title(blk_list, lst, n_rows):
+        """Fold a one-row block sitting directly on top of a list into the list
+        as its first row.
+
+        The detector sometimes hands back a list's heading (the name on a
+        profile card) as a block of its own. Left separate, its translation is
+        laid out in its own box, wraps when it is longer than the original, and
+        runs down over the list's first row. It is the list's title; as the
+        first row of the same block it is set in the same size and cannot
+        collide with what it heads.
+        """
+        lx1, ly1, lx2, ly2 = [int(v) for v in lst.xyxy]
+        row_h = (ly2 - ly1) / max(1, n_rows)
+        for other in blk_list:
+            if other is lst or getattr(other, 'vertical', False):
+                continue
+            ox1, oy1, ox2, oy2 = [int(v) for v in other.xyxy]
+            one_row = (oy2 - oy1) <= 1.6 * row_h
+            sits_on_top = ly1 - row_h <= oy2 <= ly1 + 0.5 * row_h and oy1 < ly1
+            overlap = min(lx2, ox2) - max(lx1, ox1)
+            lined_up = overlap >= 0.5 * (ox2 - ox1)
+            title = other.get_text().strip()
+            if not (one_row and sits_on_top and lined_up and title):
+                continue
+            lst.text = title + '\n' + lst.get_text()
+            lst.xyxy = [min(lx1, ox1), min(ly1, oy1), max(lx2, ox2), max(ly2, oy2)]
+            # By identity, not list.remove(): TextBlock's == compares fields and
+            # raises on some of them, and remove() compares with every block it
+            # passes on the way to the one it wants.
+            blk_list[:] = [b for b in blk_list if b is not other]
+            print('[screen_translator] list title folded into the list')
+            return
+
+    # Widest a row may be, relative to its height, when handed to the OCR.
+    _ROW_MAX_ASPECT = 4.0
+
+    @staticmethod
+    def _pad_row(row_img, paper):
+        """Pad a wide row above and below with paper colour before OCR.
+
+        manga-ocr squashes its input into a square, so a single long row
+        arrives with its characters crushed sideways. Padding towards a squarer
+        shape eases that, up to a point: measured on ten rows of a profile card
+        at two capture scales, mean similarity to the true text was 0.90 as
+        cropped, 0.96 padded to 4:1, 0.80 at 2:1 and 0.50 at 1:1 — past 4:1 the
+        text becomes too small a part of the picture.
+        """
+        import cv2
+        h, w = row_img.shape[:2]
+        want_h = int(round(w / TranslationPipeline._ROW_MAX_ASPECT))
+        if want_h <= h:
+            return row_img
+        top = (want_h - h) // 2
+        fill = paper if row_img.ndim == 2 else (paper,) * row_img.shape[2]
+        return cv2.copyMakeBorder(row_img, top, want_h - h - top, 0, 0,
+                                  cv2.BORDER_CONSTANT, value=fill)
+
+    @staticmethod
+    def _leading_bullet_width(row_img, paper):
+        """Width, in pixels from the left of a row crop, taken up by a leading
+        bullet and the gap after it; 0 when the row does not start with one.
+
+        A bullet is recognised by shape: the first blob of ink is small in both
+        directions next to the row (a dot or a dash, not a character), stands
+        clear of what follows, and something does follow.
+        """
+        cls = TranslationPipeline
+        ink = np.abs(cls._grey(row_img).astype(np.int16) - paper) > cls._BALLOON_TOL
+        rows_with_ink = np.flatnonzero(ink.any(axis=1))
+        if rows_with_ink.size == 0:
+            return 0
+        row_h = int(rows_with_ink[-1] - rows_with_ink[0] + 1)
+        cols = ink.any(axis=0)
+
+        x, n = 0, cols.size
+        while x < n and not cols[x]:
+            x += 1
+        start = x
+        while x < n and cols[x]:
+            x += 1
+        end = x                         # first blob is [start, end)
+        while x < n and not cols[x]:
+            x += 1
+        nxt = x                         # the next blob starts here
+        if nxt >= n:
+            return 0                    # nothing after it: not a bullet
+
+        blob_rows = np.flatnonzero(ink[:, start:end].any(axis=1))
+        blob_h = int(blob_rows[-1] - blob_rows[0] + 1)
+        is_bullet = (end - start <= 0.6 * row_h
+                     and blob_h <= 0.55 * row_h
+                     and nxt - end >= 0.12 * row_h)
+        return nxt if is_bullet else 0
+
     # Balloon search tuning. See _compute_balloon_xyxy.
     _BALLOON_PADS = (1.0, 2.0)       # crop margin, in multiples of the text's long side
     _BALLOON_TOL = 32                # grey levels a pixel may differ from the paper colour
     _BALLOON_MAX_AREA_RATIO = 12     # balloon/text bbox area, above which...
     _BALLOON_MAX_PAGE_SHARE = 0.10   # ...a region this much of the capture is a panel
     _BALLOON_HARD_AREA_RATIO = 40    # never a balloon, however small on the page
+    _BALLOON_ABS_PAGE_SHARE = 0.5    # over this much of the capture: the page itself
+    _BALLOON_CENTER_BAND = (0.2, 0.8)  # where the text's center must sit in the balloon
     _BALLOON_MIN_FILL = 0.4          # paper pixels / balloon bbox area
+
+    @staticmethod
+    def _grey(a):
+        import cv2
+        return a if a.ndim == 2 else cv2.cvtColor(a, cv2.COLOR_RGB2GRAY)
+
+    @staticmethod
+    def _paper_level(img, box):
+        """Grey level of the paper a text box sits on, and the box grown by the
+        ring it was sampled from: (level, (rx1, ry1, rx2, ry2)).
+
+        The most common level in a thin ring just outside the box. Text never
+        touches its outline, so that ring is almost all paper, whichever way
+        round the polarity is. Sampling inside the box instead picks the INK
+        colour for a dense bold column, where ink is the majority of the box.
+        """
+        ih, iw = img.shape[:2]
+        x1, y1, x2, y2 = box
+        ring = max(2, min(x2 - x1, y2 - y1) // 6)
+        rx1, ry1 = max(0, x1 - ring), max(0, y1 - ring)
+        rx2, ry2 = min(iw, x2 + ring), min(ih, y2 + ring)
+        around = TranslationPipeline._grey(img[ry1:ry2, rx1:rx2])
+        outside = np.ones(around.shape, bool)
+        outside[y1 - ry1:y2 - ry1, x1 - rx1:x2 - rx1] = False
+        samples = around[outside] if outside.any() else around.ravel()
+        hist = np.bincount((samples >> 3).ravel(), minlength=32)
+        return int(hist.argmax()) * 8 + 4, (rx1, ry1, rx2, ry2)
 
     @staticmethod
     def _compute_balloon_xyxy(img, text_xyxy):
@@ -452,7 +728,18 @@ class TranslationPipeline:
             sizeable share of the capture. Size relative to the text alone is
             not enough to tell — a lone "!" in a big balloon is as lopsided as
             narration loose in a panel, but the balloon is small on the page.
+          - it must not be the page: a flat background around a character is
+            one connected patch of paper too, and when the capture includes a
+            sliver of whatever surrounds the picture that patch is neatly
+            enclosed. Anything over half the capture is rejected outright, and
+            so is a patch whose text sits off in one corner of it — a balloon
+            is drawn around its text, a background just happens to have text
+            on it somewhere.
           - it must be reasonably solid rather than a thin leak along gutters.
+
+        The checks lean towards None on purpose. Calling a background a balloon
+        throws the translation into the middle of the artwork; missing a real
+        balloon only falls back to drawing it where the original text was.
         Any miss returns None and the caller falls back to the text bbox, so a
         miss never produces a worse layout than no detection at all.
         """
@@ -468,25 +755,10 @@ class TranslationPipeline:
                 return None
             tcx, tcy = (x1 + x2) / 2, (y1 + y2) / 2
 
-            def grey(a):
-                return a if a.ndim == 2 else cv2.cvtColor(a, cv2.COLOR_RGB2GRAY)
-
-            # Paper colour: the most common grey level in a thin ring just
-            # outside the text bbox. Text never touches its outline, so that
-            # ring is almost all paper, whichever way round the polarity is.
-            # (Sampling inside the bbox instead picks the INK colour for a
-            # dense bold column, where ink is the majority of the box.)
-            ring = max(2, min(tw, th) // 6)
-            rx1, ry1 = max(0, x1 - ring), max(0, y1 - ring)
-            rx2, ry2 = min(iw, x2 + ring), min(ih, y2 + ring)
-            around = grey(img[ry1:ry2, rx1:rx2])
-            outside = np.ones(around.shape, bool)
-            outside[y1 - ry1:y2 - ry1, x1 - rx1:x2 - rx1] = False
-            samples = around[outside] if outside.any() else around.ravel()
-            hist = np.bincount((samples >> 3).ravel(), minlength=32)
-            paper_level = int(hist.argmax()) * 8 + 4
-
             cls = TranslationPipeline
+            grey = cls._grey
+            paper_level, (rx1, ry1, rx2, ry2) = cls._paper_level(img, (x1, y1, x2, y2))
+
             prev_crop = None
             for pad_mul in cls._BALLOON_PADS:
                 pad = int(max(tw, th) * pad_mul)
@@ -531,6 +803,11 @@ class TranslationPipeline:
                 if not (bx1 <= tcx <= bx2 and by1 <= tcy <= by2):
                     return None
                 if lw * lh < tw * th:
+                    return None
+                if lw * lh > cls._BALLOON_ABS_PAGE_SHARE * iw * ih:
+                    return None
+                lo, hi = cls._BALLOON_CENTER_BAND
+                if not (lo <= (tcx - bx1) / lw <= hi and lo <= (tcy - by1) / lh <= hi):
                     return None
                 area_ratio = (lw * lh) / (tw * th)
                 if area_ratio > cls._BALLOON_HARD_AREA_RATIO:
