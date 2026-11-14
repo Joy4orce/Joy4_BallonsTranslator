@@ -45,6 +45,26 @@ def is_installed(package):
     return spec is not None
 
 
+def torch_cuda_tag():
+    """The CUDA tag of the installed torch wheel ('cu118', 'cu128', 'cpu'), or
+    None when torch is missing or carries no tag. Read from the wheel's version
+    string so torch itself does not have to be imported this early."""
+    try:
+        from importlib.metadata import version
+        ver = version('torch')
+    except Exception:
+        return None
+    return ver.split('+', 1)[1] if '+' in ver else None
+
+
+def torch_is_cuda11(tag):
+    """True for a CUDA 11.x torch build. requirements.txt now pins an
+    onnxruntime-gpu built against CUDA 12, and on Windows ORT loads its CUDA
+    DLLs out of torch/lib — so with a cu11x torch left in place pip upgrades
+    ORT, ORT finds no matching DLLs, and OCR drops to CPU without an error."""
+    return bool(tag) and tag.startswith('cu11')
+
+
 def run(command, desc=None, errdesc=None, custom_env=None, live=False):
     if desc is not None:
         print(desc)
@@ -259,8 +279,22 @@ def prepare_environment():
     # on a cold shader cache and leaves the card's own architecture unused.
     # onnxruntime-gpu borrows its CUDA DLLs from torch on Windows, so its pin in
     # requirements.txt has to move with this.
+    #
+    # The cu128 builds dropped everything before Turing (their arch list starts
+    # at sm_75), so a GTX 10xx or older needs TORCH_COMMAND pointed back at
+    # cu118 — together with onnxruntime-gpu<1.18 and optimum<2.0, since the
+    # three only work as a set.
     torch_command = os.environ.get('TORCH_COMMAND', "pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128 --disable-pip-version-check")
-    if args.reinstall_torch or not is_installed("torch") or not is_installed("torchvision"):
+
+    # An install that predates the move still has a cu11x torch, and plain
+    # `pip install torch` calls it satisfied. Left alone, the requirements pass
+    # below upgrades ORT past it. Only done for the default command: a custom
+    # TORCH_COMMAND is someone choosing their build on purpose.
+    stale_cuda = 'TORCH_COMMAND' not in os.environ and torch_is_cuda11(torch_cuda_tag())
+    if stale_cuda:
+        torch_command += ' --upgrade'
+
+    if args.reinstall_torch or stale_cuda or not is_installed("torch") or not is_installed("torchvision"):
         run(f'"{python}" -m {torch_command}', "Installing torch and torchvision", "Couldn't install torch", live=True)
         req_updated = True
     try:
