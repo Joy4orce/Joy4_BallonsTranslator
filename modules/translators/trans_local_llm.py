@@ -79,6 +79,42 @@ def _parse_loose_quoted_list(text: str) -> List[str]:
     return out
 
 
+# Typographic double quotes a model may use in place of ASCII ones.
+_CURLY_QUOTES = '“”„‟＂'
+_ANY_QUOTE = '"' + _CURLY_QUOTES
+# closing quote, comma, opening quote — the boundary between two entries
+_RE_ENTRY_BOUNDARY = re.compile(rf'[{_ANY_QUOTE}]\s*,\s*[{_ANY_QUOTE}]')
+
+
+def _parse_curly_quoted_list(text: str) -> List[str]:
+    """Salvage an array whose strings are delimited with typographic quotes.
+
+    Models writing Korean or Japanese reach for `“…”` out of habit, often mixed
+    with ASCII on the closing side: `[“a", “b”, “c"]`. The structure is right,
+    the delimiters are not JSON. Normalising every curly quote to `"` would
+    break as soon as one appears INSIDE an entry as real punctuation, so the
+    entries are cut at the boundaries instead — a quote, a comma, a quote — and
+    whatever sits between two boundaries is kept verbatim.
+
+    Only attempted when the text is quote-to-quote once the brackets are off
+    and actually contains a curly quote; prose with a quotation in it does not
+    qualify. An entry that itself contains `", "` over-splits, and the caller's
+    length check then rejects the result rather than accepting a wrong one.
+    """
+    s = text.strip()
+    if s.startswith('['):
+        s = s[1:]
+    if s.endswith(']'):
+        s = s[:-1]
+    s = s.strip().rstrip(',').strip()
+    if len(s) < 2 or s[0] not in _ANY_QUOTE or s[-1] not in _ANY_QUOTE:
+        return None
+    if not any(q in s for q in _CURLY_QUOTES):
+        return None
+    return [part.replace('\\"', '"').replace('\\n', '\n')
+            for part in _RE_ENTRY_BOUNDARY.split(s[1:-1])]
+
+
 def _parse_json_array(text: str) -> List[str]:
     cleaned = _RE_THINK_BLOCK.sub("", text)
     cleaned = _strip_markdown_fences(cleaned)
@@ -119,7 +155,11 @@ def _parse_json_array(text: str) -> List[str]:
         except json.JSONDecodeError:
             pass
     # 4) Not JSON at all — bare quoted chunks, separators misplaced or absent.
-    return _parse_loose_quoted_list(cleaned)
+    loose = _parse_loose_quoted_list(cleaned)
+    if loose is not None:
+        return loose
+    # 5) Right structure, typographic quotes as the string delimiters.
+    return _parse_curly_quoted_list(cleaned)
 
 
 @register_translator('Local LLM')
