@@ -176,6 +176,52 @@ def _parse_json_array(text: str) -> List[str]:
     return _parse_curly_quoted_list(cleaned)
 
 
+# Scripts a translation into each of these languages must contain. A target
+# written in Latin letters is not listed: there is nothing to tell it from
+# English by its characters alone.
+_TARGET_SCRIPTS = {
+    'Korean': [('가', '힣'), ('ㄱ', 'ㆎ')],
+    'Japanese': [('぀', 'ヿ'), ('一', '鿿')],
+    'Simplified Chinese': [('一', '鿿')],
+    'Traditional Chinese': [('一', '鿿')],
+    'Russian': [('Ѐ', 'ӿ')],
+    'Ukrainian': [('Ѐ', 'ӿ')],
+    'Thai': [('฀', '๿')],
+}
+
+
+def _count_in(text: str, ranges) -> int:
+    return sum(1 for c in text if any(lo <= c <= hi for lo, hi in ranges))
+
+
+def _count_latin(text: str) -> int:
+    return sum(1 for c in text if c.isascii() and c.isalpha())
+
+
+def _wrong_language_entries(src_list: List[str], out_list: List[str],
+                            target: str) -> List[int]:
+    """Indices of entries that came back in Latin letters although the target
+    language is not written in them — in practice, a model that was asked for
+    Korean and answered in English.
+
+    An entry counts only when it has a real run of Latin letters, none of the
+    target's own script, and a source that was not itself mostly Latin: `OK`,
+    a brand name or a line that was English to begin with are left alone.
+    """
+    ranges = _TARGET_SCRIPTS.get(target)
+    if not ranges:
+        return []
+    wrong = []
+    for i, (src, out) in enumerate(zip(src_list, out_list)):
+        latin = _count_latin(out)
+        if latin < 6 or _count_in(out, ranges) > 0:
+            continue
+        if _count_latin(src) >= 0.5 * max(1, sum(1 for c in src if c.isalpha())):
+            continue
+        wrong.append(i)
+    return wrong
+
+
 @register_translator('Local LLM')
 class LocalLLMTranslator(BaseTranslator):
 
@@ -245,7 +291,8 @@ class LocalLLMTranslator(BaseTranslator):
             "Do NOT wrap the output in markdown code fences. "
             "Do NOT add any prose, explanation, or commentary before or after the array.\n\n"
             'Example input:  ["Hello", "", "Goodbye"]\n'
-            'Example output: ["안녕하세요", "", "안녕히 가세요"]'
+            'Example output: ["안녕하세요", "", "안녕히 가세요"]\n\n'
+            f"Every translated string must be written in {tgt}."
         )
         return user_prompt + suffix
 
@@ -327,17 +374,26 @@ class LocalLLMTranslator(BaseTranslator):
         except (TypeError, ValueError):
             retry_attempts = 2
 
+        tgt = self.lang_map.get(self.lang_target) or self.lang_target
         system_prompt = self._build_system_prompt(len(src_list))
         user_text = json.dumps(src_list, ensure_ascii=False)
 
         last_err = None
+        # The last failure was the reply itself — the wrong number of entries,
+        # or nothing that parses — not the server being down or slow.
+        miscounted = False
+        off_language = None     # a full-length answer in the wrong language
         for attempt in range(1, retry_attempts + 1):
             # Bump temperature on retry to escape deterministic bad outputs
             # (notably Gemma-class echoing the source at low temps).
             attempt_temp = min(1.0, temperature + 0.2 * (attempt - 1))
+            prompt = system_prompt
+            if off_language is not None:
+                prompt += (f" Your previous answer was not in {tgt}. "
+                           f"Do not answer in English.")
             try:
                 raw = self._api_call(
-                    system_prompt, user_text, attempt_temp, max_tokens, timeout,
+                    prompt, user_text, attempt_temp, max_tokens, timeout,
                 )
             except requests.exceptions.ConnectionError as e:
                 self.logger.error(
@@ -345,15 +401,18 @@ class LocalLLMTranslator(BaseTranslator):
                     f"is the server at {self.params.get('base url')!r} running? {e}"
                 )
                 last_err = repr(e)
+                miscounted = False
                 break  # connection refused — retrying won't help
             except requests.exceptions.Timeout:
                 last_err = f"timeout after {timeout}s"
+                miscounted = False
                 self.logger.warning(
                     f"Local LLM timeout (attempt {attempt}/{retry_attempts})"
                 )
                 continue
             except Exception as e:
                 last_err = repr(e)
+                miscounted = False
                 self.logger.warning(
                     f"Local LLM call failed (attempt {attempt}/{retry_attempts}): {e}"
                 )
@@ -361,7 +420,23 @@ class LocalLLMTranslator(BaseTranslator):
 
             parsed = _parse_json_array(raw)
             if parsed is not None and len(parsed) == len(src_list):
-                return parsed
+                wrong = _wrong_language_entries(src_list, parsed, tgt)
+                if not wrong:
+                    return parsed
+                # Asked for one language, answered in another. It happens now
+                # and then with small local models and nothing about the
+                # request explains it, so: say so, keep the reply for the log,
+                # and ask again. If it will not come right, a translation in
+                # the wrong language still beats none.
+                off_language = parsed
+                miscounted = False
+                last_err = f"{len(wrong)} of {len(src_list)} entries not in {tgt}"
+                self.logger.warning(
+                    f"Local LLM answered in the wrong language ({last_err}). "
+                    f"Raw[:300]={raw[:300]!r}. Attempt {attempt}/{retry_attempts}"
+                )
+                continue
+            miscounted = True
             last_err = (
                 f"unparseable or length-mismatched response "
                 f"(got {len(parsed) if parsed is not None else 'None'} "
@@ -373,6 +448,23 @@ class LocalLLMTranslator(BaseTranslator):
             )
             if attempt < retry_attempts:
                 time.sleep(0.5)
+
+        if off_language is not None:
+            self.logger.error(
+                "Local LLM kept answering in the wrong language; using it as is")
+            return off_language
+
+        # The model keeps merging or dropping an entry, or breaking the array.
+        # That is a property of this particular list — the same one fails the
+        # same way again — and throwing the whole page away for it leaves the
+        # user with nothing. Halve it: a shorter list is easier to keep count
+        # of, and whatever still fails takes only its own half down.
+        if miscounted and len(src_list) > 1:
+            mid = len(src_list) // 2
+            self.logger.warning(
+                f"Local LLM could not return {len(src_list)} entries "
+                f"({last_err}); translating them as {mid} + {len(src_list) - mid}")
+            return self._translate(src_list[:mid]) + self._translate(src_list[mid:])
 
         self.logger.error(f"Local LLM exhausted retries: {last_err}")
         return ['' for _ in src_list]
