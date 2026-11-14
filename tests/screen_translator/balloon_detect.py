@@ -249,6 +249,7 @@ def main():
     failures += check_joined_balloons(TranslationPipeline)
     failures += check_lists(TranslationPipeline)
     failures += check_text_at_the_edge(TranslationPipeline)
+    failures += check_language_pick(TranslationPipeline)
 
     print()
     print('all cases passed' if not failures else f'{failures} case(s) failed')
@@ -519,6 +520,83 @@ def check_text_at_the_edge(pipeline_cls):
     lines = lst.get_text().split('\n')
     expect('wrapped row joined to its item',
            lines == ['・テキストテキスト', '・テキスト', '・テキスト'], repr(lines))
+    return fails
+
+
+def check_language_pick(pipeline_cls):
+    """Japanese or Chinese, from what a rough OCR read off the capture.
+
+    The Japanese OCR cannot read Chinese, so a Chinese capture needs another
+    reader — and a Japanese capture must never be handed to it by mistake.
+    """
+    from types import SimpleNamespace
+    from utils.textblock import TextBlock
+
+    fails = 0
+
+    def expect(label, cond, detail=''):
+        nonlocal fails
+        fails += 0 if cond else 1
+        print(f'{"PASS" if cond else "FAIL"}  {label:36} {detail}')
+
+    looks = pipeline_cls._looks_chinese
+    expect('japanese: kana among the kanji',
+           not looks(['今日は天気がいいですね', '明日も来てください'])[0])
+    expect('chinese: characters and no kana',
+           looks(['你今天怎么来得这么早', '我昨晚根本没睡着'])[0])
+    expect('chinese: one misread kana forgiven',
+           looks(['你今天怎么来得这么早の', '我昨晚根本没睡着一直在想考试的事'])[0])
+    expect('two kanji alone decide nothing', not looks(['既読'])[0])
+    expect('katakana names count as kana', not looks(['田中', 'カタカナ', '設定画面'])[0])
+    expect('nothing read is not chinese', not looks(['', ''])[0])
+
+    class Reader:
+        """An OCR that 'reads' the same lines off every block it is given."""
+        def __init__(self, lines):
+            self.lines, self.calls = lines, 0
+
+        def run_ocr(self, img, blks):
+            self.calls += 1
+            for b in blks:
+                b.text = list(self.lines)
+
+    def block():
+        b = TextBlock()
+        b.xyxy = [10, 10, 200, 60]
+        b.vertical = False
+        return b
+
+    def pipeline(probe_lines, japanese_ocr, chinese_ocr):
+        pipe = pipeline_cls.__new__(pipeline_cls)
+        pipe._current = SimpleNamespace(
+            source_lang='日本語', auto_detect_chinese=True, lang_probe_ocr='probe',
+            chinese_ocr_module='zh', chinese_source_lang='简体中文')
+        pipe._ocr, pipe._zh_ocr = japanese_ocr, chinese_ocr
+        pipe._probe_ocr = Reader(probe_lines)
+        return pipe
+
+    ja, zh = Reader(['こんにちは']), Reader(['你好'])
+    page = np.full((100, 300, 3), 255, np.uint8)
+
+    ocr, lang = pipeline(['今日は天気がいい'], ja, zh)._pick_reader(page, [block()], print)
+    expect('japanese capture keeps its OCR', ocr is ja and lang == '日本語', lang)
+
+    ocr, lang = pipeline(['你今天怎么来得这么早'], ja, zh)._pick_reader(page, [block()], print)
+    expect('chinese capture gets the other', ocr is zh and lang == '简体中文', lang)
+
+    pipe = pipeline(['你今天怎么来得这么早'], ja, zh)
+    pipe._current.source_lang = 'English'
+    ocr, lang = pipe._pick_reader(page, [block()], print)
+    expect('another configured source is left be',
+           ocr is ja and lang == 'English' and pipe._probe_ocr.calls == 0, lang)
+
+    # Lines of a list stay apart; lines of a paragraph are left to be joined.
+    lst, para = block(), block()
+    lst.text = ['注意事项', '・早睡早起', '・多吃蔬菜']
+    para.text = ['你今天怎么', '来得这么早']
+    pipeline_cls._keep_list_lines([lst, para])
+    expect('list lines kept apart', lst.get_text().split('\n') == ['注意事项', '・早睡早起', '・多吃蔬菜']
+           and para.get_text() == '你今天怎么来得这么早', repr(lst.get_text()))
     return fails
 
 
