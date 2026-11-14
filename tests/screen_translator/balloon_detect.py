@@ -164,9 +164,61 @@ def main():
         failures += 0 if ok else 1
         print(f'{"PASS" if ok else "FAIL"}  {case["name"]:36} {detail}')
 
+    failures += check_shared_balloon(TranslationPipeline)
+
     print()
     print('all cases passed' if not failures else f'{failures} case(s) failed')
     return 1 if failures else 0
+
+
+def check_shared_balloon(pipeline_cls):
+    """Two text blocks inside one balloon must come out as ONE block, joined in
+    reading order. Left as two, each is laid out across the whole balloon and
+    the translations are drawn on top of each other."""
+    from tools.screen_translator.pipeline import TranslatedBlock
+
+    page = new_page(500, 500, busy=False)
+    ellipse(page, (250, 250), (150, 110))
+    right = vertical_text(page, (258, 178, 328, 322), 2)
+    left = vertical_text(page, (158, 178, 228, 322), 2)
+    other_frame = (20, 20, 120, 120)
+    rect_frame(page, other_frame)
+    other = vertical_text(page, other_frame, 1)
+
+    detect = pipeline_cls._compute_balloon_xyxy
+    # Detection order deliberately not reading order: left paragraph first.
+    blocks = [
+        TranslatedBlock(left, 0.0, 'L', 'second', detect(page, left)),
+        TranslatedBlock(other, 0.0, 'O', 'elsewhere', detect(page, other)),
+        TranslatedBlock(right, 0.0, 'R', 'first', detect(page, right)),
+        TranslatedBlock((400, 400, 440, 480), 0.0, 'N', 'no balloon', None),
+    ]
+
+    fails = 0
+
+    def expect(label, cond, detail):
+        nonlocal fails
+        fails += 0 if cond else 1
+        print(f'{"PASS" if cond else "FAIL"}  {label:36} {detail}')
+
+    same = blocks[0].balloon_xyxy is not None and blocks[0].balloon_xyxy == blocks[2].balloon_xyxy
+    expect('two blocks, one balloon: same rect', same,
+           f'{blocks[0].balloon_xyxy} / {blocks[2].balloon_xyxy}')
+
+    rtl = pipeline_cls._merge_blocks_sharing_balloon(blocks, rtl=True)
+    texts = [b.translation for b in rtl]
+    expect('merged into one, right-to-left',
+           texts == ['first\nsecond', 'elsewhere', 'no balloon'], repr(texts))
+
+    ltr = pipeline_cls._merge_blocks_sharing_balloon(blocks, rtl=False)
+    expect('merged into one, left-to-right',
+           ltr[0].translation == 'second\nfirst', repr(ltr[0].translation))
+
+    m = rtl[0]
+    expect('merged text bbox spans both',
+           m.xyxy == (left[0], min(left[1], right[1]), right[2], max(left[3], right[3])),
+           str(m.xyxy))
+    return fails
 
 
 if __name__ == '__main__':
