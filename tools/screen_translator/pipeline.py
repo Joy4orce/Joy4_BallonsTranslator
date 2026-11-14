@@ -331,20 +331,21 @@ class TranslationPipeline:
               f'translate={t_tr:.2f}s  '
               f'inpaint={t_ip:.2f}s')
 
+        boxes = [tuple(int(v) for v in blk.xyxy) for blk in blk_list]
+        if self._current.fill_balloon:
+            # Use the ORIGINAL img (not inpainted) — the balloon outline is
+            # what we trace, and inpaint doesn't touch it anyway.
+            balloons = self._assign_balloons(img, boxes)
+        else:
+            balloons = [None] * len(boxes)
+
         out = []
-        for blk in blk_list:
-            x1, y1, x2, y2 = [int(v) for v in blk.xyxy]
+        for blk, (x1, y1, x2, y2), balloon_xyxy in zip(blk_list, boxes, balloons):
             src = blk.get_text() if hasattr(blk, 'get_text') else ''
             if isinstance(src, list):
                 src = '\n'.join(src)
             tr = getattr(blk, 'translation', '') or ''
             angle = float(getattr(blk, 'angle', 0) or 0)
-
-            balloon_xyxy = None
-            if self._current.fill_balloon:
-                # Use the ORIGINAL img (not inpainted) — the balloon outline
-                # is what we trace, and inpaint doesn't touch it anyway.
-                balloon_xyxy = self._compute_balloon_xyxy(img, (x1, y1, x2, y2))
 
             out.append(TranslatedBlock(
                 xyxy=(x1, y1, x2, y2),
@@ -359,6 +360,67 @@ class TranslationPipeline:
             out = self._merge_blocks_sharing_balloon(
                 out, rtl=self._current.source_lang in RTL_SOURCE_LANGS)
         return out, inpainted_img
+
+    @staticmethod
+    def _iou(a, b):
+        ix = min(a[2], b[2]) - max(a[0], b[0])
+        iy = min(a[3], b[3]) - max(a[1], b[1])
+        if ix <= 0 or iy <= 0:
+            return 0.0
+        inter = ix * iy
+        union = ((a[2] - a[0]) * (a[3] - a[1])
+                 + (b[2] - b[0]) * (b[3] - b[1]) - inter)
+        return inter / union if union > 0 else 0.0
+
+    @classmethod
+    def _text_is_centered(cls, balloon, text_box):
+        """Whether `text_box` sits in the middle of `balloon` on both axes."""
+        lo, hi = cls._BALLOON_CENTER_BAND
+        bw, bh = balloon[2] - balloon[0], balloon[3] - balloon[1]
+        if bw <= 0 or bh <= 0:
+            return False
+        rx = ((text_box[0] + text_box[2]) / 2 - balloon[0]) / bw
+        ry = ((text_box[1] + text_box[3]) / 2 - balloon[1]) / bh
+        return lo <= rx <= hi and lo <= ry <= hi
+
+    @classmethod
+    def _assign_balloons(cls, img, boxes):
+        """The balloon for each text box, or None — one entry per box.
+
+        Filling a balloon re-centres the text in it. That is only right when
+        the original text was centred there to begin with; otherwise the patch
+        of paper under the text is not a balloon drawn around it, it is a
+        background that happens to have text on it, and "filling" it moves the
+        translation away from where the original was — into the middle of the
+        artwork, in the cases that prompted this.
+
+        Centring is judged per balloon, not per block: two paragraphs side by
+        side in one balloon are each off-centre and centred as a pair. So
+        patches are found first, boxes sharing one are grouped, and the group's
+        combined text has to sit in the middle of it.
+        """
+        found = [cls._compute_balloon_xyxy(img, box, check_center=False)
+                 for box in boxes]
+        groups = []          # each: indices of boxes sharing one patch
+        for i, balloon in enumerate(found):
+            if balloon is None:
+                continue
+            home = next((g for g in groups
+                         if cls._iou(found[g[0]], balloon) >= 0.8), None)
+            if home is not None:
+                home.append(i)
+            else:
+                groups.append([i])
+
+        out = [None] * len(boxes)
+        for group in groups:
+            text = (min(boxes[i][0] for i in group), min(boxes[i][1] for i in group),
+                    max(boxes[i][2] for i in group), max(boxes[i][3] for i in group))
+            balloon = found[group[0]]
+            if cls._text_is_centered(balloon, text):
+                for i in group:
+                    out[i] = found[i]
+        return out
 
     @staticmethod
     def _merge_blocks_sharing_balloon(blocks, rtl):
@@ -668,7 +730,8 @@ class TranslationPipeline:
     _BALLOON_MAX_PAGE_SHARE = 0.10   # ...a region this much of the capture is a panel
     _BALLOON_HARD_AREA_RATIO = 40    # never a balloon, however small on the page
     _BALLOON_ABS_PAGE_SHARE = 0.5    # over this much of the capture: the page itself
-    _BALLOON_CENTER_BAND = (0.2, 0.8)  # where the text's center must sit in the balloon
+    _BALLOON_CENTER_BAND = (0.3, 0.7)  # where the text's center must sit in the balloon
+    _BALLOON_MAX_ENCLOSED = 0.04     # largest foreign object inside, / balloon bbox area
     _BALLOON_MIN_FILL = 0.4          # paper pixels / balloon bbox area
 
     @staticmethod
@@ -699,9 +762,13 @@ class TranslationPipeline:
         return int(hist.argmax()) * 8 + 4, (rx1, ry1, rx2, ry2)
 
     @staticmethod
-    def _compute_balloon_xyxy(img, text_xyxy):
+    def _compute_balloon_xyxy(img, text_xyxy, check_center=True):
         """Find the balloon or caption frame enclosing `text_xyxy` and return
         its bounding box in image coords, or None if there isn't a clean one.
+
+        `check_center=False` skips the test that the text sits in the middle of
+        the patch, for _assign_balloons, which applies it to all the text in a
+        balloon together rather than block by block.
 
         The balloon is taken to be the connected patch of "paper" the text sits
         on: every pixel within a tolerance of the background colour between the
@@ -728,13 +795,14 @@ class TranslationPipeline:
             sizeable share of the capture. Size relative to the text alone is
             not enough to tell — a lone "!" in a big balloon is as lopsided as
             narration loose in a panel, but the balloon is small on the page.
-          - it must not be the page: a flat background around a character is
-            one connected patch of paper too, and when the capture includes a
+          - it must not be the page. A flat background around a figure is one
+            connected patch of paper too, and when the capture includes a
             sliver of whatever surrounds the picture that patch is neatly
-            enclosed. Anything over half the capture is rejected outright, and
-            so is a patch whose text sits off in one corner of it — a balloon
-            is drawn around its text, a background just happens to have text
-            on it somewhere.
+            enclosed — the whole background, or just the piece of it on one
+            side of the figure. Three things tell it from a balloon: it is over
+            half the capture; or it has something large sitting inside it that
+            is not this text (another balloon, typically — a balloon holds
+            glyphs and nothing else); or the text is not in the middle of it.
           - it must be reasonably solid rather than a thin leak along gutters.
 
         The checks lean towards None on purpose. Calling a background a balloon
@@ -806,9 +874,26 @@ class TranslationPipeline:
                     return None
                 if lw * lh > cls._BALLOON_ABS_PAGE_SHARE * iw * ih:
                     return None
-                lo, hi = cls._BALLOON_CENTER_BAND
-                if not (lo <= (tcx - bx1) / lw <= hi and lo <= (tcy - by1) / lh <= hi):
+                if check_center and not cls._text_is_centered(
+                        (bx1, by1, bx2, by2), (x1, y1, x2, y2)):
                     return None
+
+                # Anything large enclosed by the patch that is not this text.
+                # Own glyphs are blanked first; another paragraph's glyphs in
+                # the same balloon are each far too small to count.
+                foreign = labels[ly:ly + lh, lx:lx + lw] != label
+                fx1, fy1 = max(0, rx1 - cx1 - lx), max(0, ry1 - cy1 - ly)
+                fx2, fy2 = min(lw, rx2 - cx1 - lx), min(lh, ry2 - cy1 - ly)
+                if fx2 > fx1 and fy2 > fy1:
+                    foreign[fy1:fy2, fx1:fx2] = False
+                fn, _fl, fstats, _ = cv2.connectedComponentsWithStats(
+                    foreign.astype(np.uint8), connectivity=8)
+                for k in range(1, fn):
+                    ox, oy, ow, oh, oarea = (int(v) for v in fstats[k])
+                    enclosed = ox > 0 and oy > 0 and ox + ow < lw and oy + oh < lh
+                    if enclosed and oarea > cls._BALLOON_MAX_ENCLOSED * lw * lh:
+                        return None
+
                 area_ratio = (lw * lh) / (tw * th)
                 if area_ratio > cls._BALLOON_HARD_AREA_RATIO:
                     return None
