@@ -62,7 +62,10 @@ DETECTOR_PARAM_OVERRIDES: dict = {}
 INPAINTER_PARAM_OVERRIDES: dict = {}
 
 # ── Trigger / UI ────────────────────────────────────────────────────────────
-GLOBAL_HOTKEY = 'ctrl+alt+t'    # None to disable
+# Ctrl, Alt and X all sit in the bottom-left corner, so this is reachable with
+# the left hand alone — the other hand is usually on the mouse, about to drag
+# out the capture region. None to disable.
+GLOBAL_HOTKEY = 'ctrl+alt+x'
 OVERLAY_AUTO_DISMISS_MS = 0     # 0 = stay until clicked / ESC
 OVERLAY_BOX_OPACITY = 0.85
 OVERLAY_FONT_SIZE = 14
