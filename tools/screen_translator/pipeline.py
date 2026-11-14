@@ -335,7 +335,15 @@ class TranslationPipeline:
         if self._current.fill_balloon:
             # Use the ORIGINAL img (not inpainted) — the balloon outline is
             # what we trace, and inpaint doesn't touch it anyway.
-            balloons = self._assign_balloons(img, boxes)
+            reasons = []
+            balloons = self._assign_balloons(img, boxes, reasons)
+            # One line per block: which way it will be laid out, and why. A
+            # block with no balloon is drawn at its own text box, which is the
+            # layout that goes wrong when the decision was mistaken.
+            for box, balloon, reason in zip(boxes, balloons, reasons):
+                print(f'[screen_translator] block {box}: '
+                      + (f'balloon {balloon}' if balloon is not None
+                         else f'no balloon ({reason})'))
         else:
             balloons = [None] * len(boxes)
 
@@ -384,8 +392,29 @@ class TranslationPipeline:
         return lo <= rx <= hi and lo <= ry <= hi
 
     @classmethod
-    def _assign_balloons(cls, img, boxes):
-        """The balloon for each text box, or None — one entry per box.
+    def _size_reason(cls, balloon, text_box, iw, ih):
+        """Why `balloon` is too big to be the balloon of `text_box`, or None.
+
+        Far larger than its text AND a sizeable share of the capture is a
+        panel, not a balloon. Size relative to the text alone is not enough to
+        tell — a lone "!" in a big balloon is as lopsided as narration loose in
+        a panel — but the balloon is small on the page.
+        """
+        area = (balloon[2] - balloon[0]) * (balloon[3] - balloon[1])
+        text = max(1, (text_box[2] - text_box[0]) * (text_box[3] - text_box[1]))
+        ratio, share = area / text, area / (iw * ih)
+        if ratio > cls._BALLOON_HARD_AREA_RATIO:
+            return f'patch is {ratio:.0f}x the text'
+        if ratio > cls._BALLOON_MAX_AREA_RATIO and share > cls._BALLOON_MAX_PAGE_SHARE:
+            return (f'patch is {ratio:.0f}x the text and {share:.0%} of the '
+                    f'capture (a panel)')
+        return None
+
+    @classmethod
+    def _assign_balloons(cls, img, boxes, reasons=None):
+        """The balloon for each text box, or None — one entry per box. A list
+        passed as `reasons` is filled with, per box, why it got no balloon
+        (None where it got one).
 
         Filling a balloon re-centres the text in it. That is only right when
         the original text was centred there to begin with; otherwise the patch
@@ -399,8 +428,15 @@ class TranslationPipeline:
         patches are found first, boxes sharing one are grouped, and the group's
         combined text has to sit in the middle of it.
         """
-        found = [cls._compute_balloon_xyxy(img, box, check_center=False)
-                 for box in boxes]
+        found, masks, why_not = [], [], []
+        for box in boxes:
+            info, why = {}, []
+            found.append(cls._compute_balloon_xyxy(
+                img, box, check_center=False, check_fill=False,
+                check_size=False, all_text=boxes, out=info, why=why))
+            masks.append(info.get('mask'))
+            why_not.append(why[0] if why else None)
+
         groups = []          # each: indices of boxes sharing one patch
         for i, balloon in enumerate(found):
             if balloon is None:
@@ -412,15 +448,168 @@ class TranslationPipeline:
             else:
                 groups.append([i])
 
+        def union(idx):
+            return (min(boxes[i][0] for i in idx), min(boxes[i][1] for i in idx),
+                    max(boxes[i][2] for i in idx), max(boxes[i][3] for i in idx))
+
+        ih, iw = img.shape[:2]
+
+        def verdict(rect, idx):
+            """None if `rect` can be the balloon of blocks `idx`, else why not."""
+            text = union(idx)
+            if not cls._text_is_centered(rect, text):
+                return 'text is not in the middle of the patch'
+            return cls._size_reason(rect, text, iw, ih)
+
         out = [None] * len(boxes)
         for group in groups:
-            text = (min(boxes[i][0] for i in group), min(boxes[i][1] for i in group),
-                    max(boxes[i][2] for i in group), max(boxes[i][3] for i in group))
-            balloon = found[group[0]]
-            if cls._text_is_centered(balloon, text):
+            balloon, mask = found[group[0]], masks[group[0]]
+
+            # As one balloon first. That is the simplest reading and the one
+            # that has been giving good results: text split across two blocks,
+            # or across two balloons drawn well into each other, is joined and
+            # set once in the middle.
+            fill = float(mask.mean()) if mask is not None else 1.0
+            if fill >= cls._BALLOON_MIN_FILL:
+                problem = verdict(balloon, group)
                 for i in group:
-                    out[i] = found[i]
+                    if problem is None:
+                        out[i] = balloon
+                    else:
+                        why_not[i] = problem
+                continue
+
+            # Too sparse to be one balloon. With text in more than one place
+            # it may be two balloons joined at an angle — little of the box
+            # around the pair is paper, though each is solid enough on its own.
+            reason = f'patch fills only {fill:.0%} of its box'
+            lobes = (cls._split_into_lobes(balloon, mask, [boxes[i] for i in group])
+                     if len(group) > 1 else [])
+            for i in group:
+                why_not[i] = reason
+            if len(lobes) < 2:
+                continue
+            for members, rect, lobe_fill in lobes:
+                idx = [group[k] for k in members]
+                if lobe_fill < cls._BALLOON_MIN_FILL:
+                    continue
+                problem = verdict(rect, idx)
+                for i in idx:
+                    if problem is None:
+                        out[i] = rect
+                    else:
+                        why_not[i] = problem + ' (its part of a joined pair)'
+        if reasons is not None:
+            reasons[:] = [None if out[i] is not None else why_not[i]
+                          for i in range(len(boxes))]
         return out
+
+    @staticmethod
+    def _split_into_lobes(balloon, mask, text_boxes):
+        """Divide one patch among the text on it:
+        [(member indices, rect, share of rect that is paper), ...].
+
+        Two balloons drawn overlapping are a single patch of paper, but they are
+        still two balloons, each with its own text. Laid out as one, the two
+        utterances would be run together in the middle of the pair.
+
+        Text boxes belong to the same lobe when what lies between them is
+        paper: the part of their joint convex hull outside the boxes themselves
+        is mostly patch. That holds for paragraphs side by side in one balloon
+        and fails across the notch where two balloons meet. Each lobe then
+        takes the part of the patch nearest its own text. A patch with a single
+        lobe comes back whole, as before.
+
+        It has to be actual paper, measured between the boxes only. Filling in
+        the patch's outline to get rid of the glyph holes also fills in any
+        artwork the balloons wrap around — hair across a balloon, say — and
+        then everything looks connected.
+        """
+        import cv2
+
+        n = len(text_boxes)
+        if mask is None:
+            return [(list(range(n)), balloon, 1.0)]
+        whole = [(list(range(n)), balloon, float(mask.mean()))]
+        if n < 2:
+            return whole
+        bx1, by1 = balloon[0], balloon[1]
+        h, w = mask.shape
+
+        paper = mask.astype(np.uint8)
+
+        def local(box):
+            x1, y1, x2, y2 = box
+            return (max(0, x1 - bx1), max(0, y1 - by1),
+                    min(w, x2 - bx1), min(h, y2 - by1))
+
+        def corners(box):
+            x1, y1, x2, y2 = box
+            return [(x1 - bx1, y1 - by1), (x2 - bx1, y1 - by1),
+                    (x2 - bx1, y2 - by1), (x1 - bx1, y2 - by1)]
+
+        parent = list(range(n))
+
+        def root(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                pts = np.array(corners(text_boxes[i]) + corners(text_boxes[j]), np.int32)
+                hull = np.zeros((h, w), np.uint8)
+                cv2.fillConvexPoly(hull, cv2.convexHull(pts), 1)
+                hull_area = int(hull.sum())
+                between = hull.copy()
+                for k in (i, j):
+                    ax1, ay1, ax2, ay2 = local(text_boxes[k])
+                    between[ay1:ay2, ax1:ax2] = 0
+                gap = int(between.sum())
+                # Boxes that all but touch have nothing between them to judge.
+                if gap < 0.05 * hull_area or int((between & paper).sum()) >= 0.8 * gap:
+                    parent[root(i)] = root(j)
+
+        clusters = {}
+        for i in range(n):
+            clusters.setdefault(root(i), []).append(i)
+        clusters = list(clusters.values())
+        if len(clusters) < 2:
+            return whole
+
+        # Each lobe: the patch pixels nearer its text than any other lobe's.
+        ys, xs = np.mgrid[0:h, 0:w]
+        xs = xs + bx1
+        ys = ys + by1
+        dist = []
+        for members in clusters:
+            best = np.full((h, w), np.inf)
+            for k in members:
+                x1, y1, x2, y2 = text_boxes[k]
+                dx = np.maximum(np.maximum(x1 - xs, xs - x2), 0)
+                dy = np.maximum(np.maximum(y1 - ys, ys - y2), 0)
+                best = np.minimum(best, np.hypot(dx, dy))
+            dist.append(best)
+        nearest = np.argmin(np.stack(dist), axis=0)
+
+        lobes = []
+        for c, members in enumerate(clusters):
+            cell = (nearest == c) & mask
+            rows = np.flatnonzero(cell.any(axis=1))
+            cols = np.flatnonzero(cell.any(axis=0))
+            if rows.size == 0 or cols.size == 0:
+                continue
+            r0, r1, c0, c1 = int(rows[0]), int(rows[-1]) + 1, int(cols[0]), int(cols[-1]) + 1
+            # Its own text counts as filled: the ink is not paper, but it is
+            # not a gap in the balloon either.
+            filled = cell.copy()
+            for k in members:
+                ax1, ay1, ax2, ay2 = local(text_boxes[k])
+                filled[ay1:ay2, ax1:ax2] = True
+            lobes.append((members, (bx1 + c0, by1 + r0, bx1 + c1, by1 + r1),
+                          float(filled[r0:r1, c0:c1].mean())))
+        return lobes
 
     @staticmethod
     def _merge_blocks_sharing_balloon(blocks, rtl):
@@ -762,13 +951,24 @@ class TranslationPipeline:
         return int(hist.argmax()) * 8 + 4, (rx1, ry1, rx2, ry2)
 
     @staticmethod
-    def _compute_balloon_xyxy(img, text_xyxy, check_center=True):
+    def _compute_balloon_xyxy(img, text_xyxy, check_center=True, why=None,
+                              all_text=None, out=None, check_fill=True,
+                              check_size=True):
         """Find the balloon or caption frame enclosing `text_xyxy` and return
         its bounding box in image coords, or None if there isn't a clean one.
 
         `check_center=False` skips the test that the text sits in the middle of
         the patch, for _assign_balloons, which applies it to all the text in a
-        balloon together rather than block by block.
+        balloon together rather than block by block. Pass a list as `why` to
+        have the reason for a None appended to it. `all_text` is every text box
+        on the page, so that other text sitting on the same patch is not
+        mistaken for something foreign inside it. A dict passed as `out` gets
+        the patch itself under 'mask', as a boolean array over the returned box.
+        `check_fill=False` leaves the solidity test to the caller, which needs
+        to apply it per lobe: two balloons joined at an angle fill little of
+        the box around the pair, and a good deal of the box around each.
+        `check_size=False` likewise leaves the patch-versus-text size test to
+        the caller, which has to weigh the patch against ALL the text on it.
 
         The balloon is taken to be the connected patch of "paper" the text sits
         on: every pixel within a tolerance of the background colour between the
@@ -811,6 +1011,12 @@ class TranslationPipeline:
         Any miss returns None and the caller falls back to the text bbox, so a
         miss never produces a worse layout than no detection at all.
         """
+        def no(reason):
+            if why is not None:
+                why.append(reason)
+            return None
+
+        last = 'no search was possible'
         try:
             import cv2
 
@@ -820,7 +1026,7 @@ class TranslationPipeline:
             x2, y2 = min(iw, x2), min(ih, y2)
             tw, th = x2 - x1, y2 - y1
             if tw < 2 or th < 2:
-                return None
+                return no('text box is empty')
             tcx, tcy = (x1 + x2) / 2, (y1 + y2) / 2
 
             cls = TranslationPipeline
@@ -843,7 +1049,7 @@ class TranslationPipeline:
                 n, labels, stats, _ = cv2.connectedComponentsWithStats(
                     paper, connectivity=4)
                 if n < 2:
-                    return None
+                    return no('no paper-coloured pixels around the text')
 
                 # The paper patch that owns most of the text bbox and its
                 # ring. Counters enclosed by glyphs are separate, much smaller
@@ -853,7 +1059,7 @@ class TranslationPipeline:
                 owned[0] = 0
                 label = int(owned.argmax())
                 if owned[label] == 0:
-                    return None
+                    return no('no paper patch under the text')
                 lx, ly, lw, lh, area = (int(v) for v in stats[label])
 
                 at_l, at_t = lx == 0, ly == 0
@@ -861,50 +1067,73 @@ class TranslationPipeline:
                 cut_off = ((at_l and cx1 > 0) or (at_t and cy1 > 0)
                            or (at_r and cx2 < iw) or (at_b and cy2 < ih))
                 if cut_off:
+                    last = 'patch runs past the search area (open, or very large)'
                     continue    # extent unknown at this crop size
 
                 # Extent is real from here on, so a failed check is final.
                 if at_l + at_t + at_r + at_b >= 3:
-                    return None
+                    return no('patch reaches three or more edges of the capture')
                 bx1, by1 = cx1 + lx, cy1 + ly
                 bx2, by2 = bx1 + lw, by1 + lh
                 if not (bx1 <= tcx <= bx2 and by1 <= tcy <= by2):
-                    return None
+                    return no('patch does not contain the text centre')
                 if lw * lh < tw * th:
-                    return None
-                if lw * lh > cls._BALLOON_ABS_PAGE_SHARE * iw * ih:
-                    return None
+                    return no('patch is smaller than the text')
+                share = lw * lh / (iw * ih)
+                if share > cls._BALLOON_ABS_PAGE_SHARE:
+                    return no(f'patch is {share:.0%} of the capture (the page)')
                 if check_center and not cls._text_is_centered(
                         (bx1, by1, bx2, by2), (x1, y1, x2, y2)):
-                    return None
+                    return no('text is not in the middle of the patch')
 
-                # Anything large enclosed by the patch that is not this text.
-                # Own glyphs are blanked first; another paragraph's glyphs in
-                # the same balloon are each far too small to count.
+                # Anything large enclosed by the patch that is not text sitting
+                # on it. This block's glyphs are blanked first, and so is any
+                # other block whose own paper is this same patch: a second
+                # paragraph, or the text of a balloon joined onto this one.
+                # Dense glyphs run together into one blob easily big enough to
+                # look like an object. Text standing on a DIFFERENT patch is
+                # left in — that is another balloon lying inside a background.
                 foreign = labels[ly:ly + lh, lx:lx + lw] != label
-                fx1, fy1 = max(0, rx1 - cx1 - lx), max(0, ry1 - cy1 - ly)
-                fx2, fy2 = min(lw, rx2 - cx1 - lx), min(lh, ry2 - cy1 - ly)
-                if fx2 > fx1 and fy2 > fy1:
-                    foreign[fy1:fy2, fx1:fx2] = False
+
+                def blank(box):
+                    ring = max(2, min(box[2] - box[0], box[3] - box[1]) // 6)
+                    ax1 = max(0, box[0] - ring - cx1)
+                    ay1 = max(0, box[1] - ring - cy1)
+                    ax2 = min(crop_w, box[2] + ring - cx1)
+                    ay2 = min(crop_h, box[3] + ring - cy1)
+                    if ax2 <= ax1 or ay2 <= ay1:
+                        return
+                    counts = np.bincount(labels[ay1:ay2, ax1:ax2].ravel(), minlength=n)
+                    counts[0] = 0
+                    if int(counts.argmax()) != label or counts[label] == 0:
+                        return          # stands on some other patch
+                    foreign[max(0, ay1 - ly):max(0, ay2 - ly),
+                            max(0, ax1 - lx):max(0, ax2 - lx)] = False
+
+                blank((x1, y1, x2, y2))
+                for other in all_text or ():
+                    blank(tuple(int(v) for v in other))
                 fn, _fl, fstats, _ = cv2.connectedComponentsWithStats(
                     foreign.astype(np.uint8), connectivity=8)
                 for k in range(1, fn):
                     ox, oy, ow, oh, oarea = (int(v) for v in fstats[k])
                     enclosed = ox > 0 and oy > 0 and ox + ow < lw and oy + oh < lh
                     if enclosed and oarea > cls._BALLOON_MAX_ENCLOSED * lw * lh:
-                        return None
+                        return no(f'patch encloses a foreign object '
+                                  f'({oarea / (lw * lh):.0%} of it)')
 
-                area_ratio = (lw * lh) / (tw * th)
-                if area_ratio > cls._BALLOON_HARD_AREA_RATIO:
-                    return None
-                if (area_ratio > cls._BALLOON_MAX_AREA_RATIO
-                        and lw * lh > cls._BALLOON_MAX_PAGE_SHARE * iw * ih):
-                    return None
-                if area < cls._BALLOON_MIN_FILL * lw * lh:
-                    return None
+                if check_size:
+                    too_big = cls._size_reason(
+                        (bx1, by1, bx2, by2), (x1, y1, x2, y2), iw, ih)
+                    if too_big:
+                        return no(too_big)
+                if check_fill and area < cls._BALLOON_MIN_FILL * lw * lh:
+                    return no(f'patch fills only {area / (lw * lh):.0%} of its box')
+                if out is not None:
+                    out['mask'] = labels[ly:ly + lh, lx:lx + lw] == label
                 return (bx1, by1, bx2, by2)
 
-            return None
+            return no(last)
         except Exception as e:
             print(f'[screen_translator] balloon detect failed '
                   f'({type(e).__name__}: {e}); using text bbox')
