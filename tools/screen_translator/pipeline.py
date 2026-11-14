@@ -71,6 +71,11 @@ class TranslationPipeline:
         self._translator = None
         self._inpainter = None
         self._translators_imported = False
+        # Chinese captures (see config.AUTO_DETECT_CHINESE): a fast OCR that
+        # only tells the language, and the OCR that reads Chinese, loaded the
+        # first time one turns up.
+        self._probe_ocr = None
+        self._zh_ocr = None
 
     # ── Module registration (imports trans_*.py once) ───────────────────────
 
@@ -133,6 +138,28 @@ class TranslationPipeline:
             )
             self._ocr.load_model()
 
+        # The language probe is loaded up front so the first capture does not
+        # wait for it; the Chinese OCR only when a Chinese capture arrives.
+        if not self._auto_chinese(settings):
+            self._probe_ocr = self._zh_ocr = None
+        else:
+            stale = (prev is None or prev.device != settings.device
+                     or getattr(prev, 'lang_probe_ocr', None) != settings.lang_probe_ocr
+                     or getattr(prev, 'chinese_ocr_module', None) != settings.chinese_ocr_module)
+            if stale:
+                self._zh_ocr = None
+            if stale or self._probe_ocr is None:
+                _emit(f'Loading language probe: {settings.lang_probe_ocr}...')
+                try:
+                    self._probe_ocr = self._load_ocr(settings.lang_probe_ocr, settings)
+                except Exception as e:
+                    # Without it every capture is simply taken as the configured
+                    # language, which is how things were before.
+                    self._probe_ocr = None
+                    print(f'[screen_translator] language probe unavailable '
+                          f'({type(e).__name__}: {e}); captures are read as '
+                          f'{settings.source_lang}')
+
         tr_params = settings.translator_params.get(settings.translator_module)
         if (prev is None
                 or prev.translator_module != settings.translator_module
@@ -175,6 +202,90 @@ class TranslationPipeline:
 
         self._current = copy.deepcopy(settings)
         _emit('Pipeline ready.')
+
+    # ── Chinese captures ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _auto_chinese(settings) -> bool:
+        """Whether captures are checked for Chinese: only when asked for, and
+        only when the configured source is Japanese — any other source language
+        was chosen on purpose and is left alone."""
+        return bool(getattr(settings, 'auto_detect_chinese', False)
+                    and settings.source_lang == '日本語'
+                    and getattr(settings, 'lang_probe_ocr', None)
+                    and getattr(settings, 'chinese_ocr_module', None))
+
+    def _load_ocr(self, name, settings):
+        from modules import OCR
+        cls = OCR.module_dict[name]
+        ocr = cls(**self._build_module_params(
+            cls, settings.ocr_params.get(name), settings.device))
+        ocr.load_model()
+        return ocr
+
+    @staticmethod
+    def _looks_chinese(texts):
+        """(is_chinese, kana, hanzi) for what the probe read off a capture.
+
+        Japanese cannot be written without kana: particles, verb endings and
+        loanwords are all kana, and a page of it reads as more kana than kanji.
+        Chinese has none. So: a fair number of Chinese characters and next to
+        no kana. "Next to no" rather than none because the probe is a rough
+        reader and will now and then see a kana in a Chinese character; a few
+        characters at least, because two kanji on their own (a sign, a label)
+        say nothing either way and are left as the configured language.
+        """
+        joined = ''.join(texts)
+        kana = sum(1 for c in joined if '぀' <= c <= 'ヿ' and c not in '・ー')
+        hanzi = sum(1 for c in joined if '一' <= c <= '鿿')
+        return (hanzi >= 4 and kana <= 0.05 * hanzi), kana, hanzi
+
+    def _pick_reader(self, img, blk_list, emit):
+        """The OCR and source language for this capture: (ocr, source_lang).
+
+        Runs the probe over the detected blocks, and switches to the Chinese
+        OCR when what it read is Chinese. The probe's reading is thrown away —
+        whichever OCR is picked reads every block again.
+        """
+        cur = self._current
+        if self._probe_ocr is None or not self._auto_chinese(cur):
+            return self._ocr, cur.source_lang
+        t0 = time.time()
+        try:
+            self._probe_ocr.run_ocr(img, blk_list)
+            chinese, kana, hanzi = self._looks_chinese(
+                [blk.get_text() for blk in blk_list])
+        except Exception as e:
+            print(f'[screen_translator] language probe failed '
+                  f'({type(e).__name__}: {e}); reading as {cur.source_lang}')
+            return self._ocr, cur.source_lang
+        lang = cur.chinese_source_lang if chinese else cur.source_lang
+        print(f'[screen_translator] language: {lang} '
+              f'(probe read {kana} kana, {hanzi} hanzi, {time.time() - t0:.2f}s)')
+        if not chinese:
+            return self._ocr, cur.source_lang
+        if self._zh_ocr is None:
+            emit(f'Loading OCR: {cur.chinese_ocr_module}...')
+            try:
+                self._zh_ocr = self._load_ocr(cur.chinese_ocr_module, cur)
+            except Exception as e:
+                print(f'[screen_translator] Chinese OCR unavailable '
+                      f'({type(e).__name__}: {e}); reading as {cur.source_lang}')
+                return self._ocr, cur.source_lang
+        return self._zh_ocr, cur.chinese_source_lang
+
+    @classmethod
+    def _keep_list_lines(cls, blk_list):
+        """For an OCR that reads a block line by line: keep the lines of a list
+        apart. Joined end to end, as a paragraph's lines rightly are, the items
+        of a list run together and cannot be told apart again."""
+        for blk in blk_list:
+            lines = blk.text if isinstance(blk.text, list) else None
+            if not lines or getattr(blk, 'vertical', False):
+                continue
+            lines = [t.strip() for t in lines if t and t.strip()]
+            if len(lines) >= 2 and any(cls._is_list_item(t) for t in lines):
+                blk.text = '\n'.join(lines)
 
     # ── Convenience: original "ensure loaded" entry point ──────────────────
 
@@ -269,19 +380,44 @@ class TranslationPipeline:
 
         _emit(f'OCR ({len(blk_list)} blocks)...')
         t0 = time.time()
-        self._ocr.run_ocr(img, blk_list)
-        try:
-            self._reread_lists(img, blk_list, mask)
-        except Exception as e:
-            # Purely an improvement over the block-level read; never let it
-            # take the capture down.
-            print(f'[screen_translator] list re-read skipped '
-                  f'({type(e).__name__}: {e})')
+        ocr, source_lang = self._pick_reader(img, blk_list, _emit)
+        ocr.run_ocr(img, blk_list)
+        if ocr is not self._ocr:
+            # The probe is a rough reader. The Chinese OCR is a careful one
+            # that also knows kana, so its reading settles it: kana in what it
+            # read means the capture was Japanese after all, and Japanese is
+            # read by the Japanese OCR.
+            chinese, kana, hanzi = self._looks_chinese(
+                [blk.get_text() for blk in blk_list])
+            if not chinese:
+                print(f'[screen_translator] language: {self._current.source_lang} '
+                      f'after all (read {kana} kana, {hanzi} hanzi)')
+                ocr, source_lang = self._ocr, self._current.source_lang
+                ocr.run_ocr(img, blk_list)
+        if ocr is self._ocr:
+            try:
+                self._reread_lists(img, blk_list, mask)
+            except Exception as e:
+                # Purely an improvement over the block-level read; never let it
+                # take the capture down.
+                print(f'[screen_translator] list re-read skipped '
+                      f'({type(e).__name__}: {e})')
+        else:
+            # The Chinese OCR reads line by line already; the row-by-row
+            # re-read exists for one that reads a block as a single picture.
+            self._keep_list_lines(blk_list)
         t_ocr = time.time() - t0
 
         _emit(f'Translating ({len(blk_list)} blocks)...')
         t0 = time.time()
-        self._translator.translate_textblk_lst(blk_list)
+        # The translator is built for the configured source language; for a
+        # capture in another one it is told so for this call only.
+        configured_lang = self._translator.lang_source
+        self._translator.lang_source = source_lang
+        try:
+            self._translator.translate_textblk_lst(blk_list)
+        finally:
+            self._translator.lang_source = configured_lang
         t_tr = time.time() - t0
 
         inpainted_img = None
@@ -382,7 +518,7 @@ class TranslationPipeline:
         if self._current.fill_balloon:
             from modules.translators.base import RTL_SOURCE_LANGS
             out = self._merge_blocks_sharing_balloon(
-                out, rtl=self._current.source_lang in RTL_SOURCE_LANGS)
+                out, rtl=source_lang in RTL_SOURCE_LANGS)
         return out, inpainted_img
 
     @staticmethod
@@ -1070,7 +1206,7 @@ class TranslationPipeline:
         return nxt if is_bullet else 0
 
     # Balloon search tuning. See _compute_balloon_xyxy.
-    _BALLOON_PADS = (1.0, 2.0)       # crop margin, in multiples of the text's long side
+    _BALLOON_PADS = (1.0, 2.0, 4.0)  # crop margin, in multiples of the text's long side
     _BALLOON_TOL = 32                # grey levels a pixel may differ from the paper colour
     _BALLOON_MAX_AREA_RATIO = 12     # balloon/text bbox area, above which...
     _BALLOON_MAX_PAGE_SHARE = 0.10   # ...a region this much of the capture is a panel

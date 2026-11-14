@@ -27,6 +27,21 @@ INPAINTER_MODULE = None
 SOURCE_LANG = None
 TARGET_LANG = None
 
+# ── Chinese captures ────────────────────────────────────────────────────────
+# With the source language set to Japanese, a capture that turns out to be
+# Chinese is read and translated as Chinese instead. Japanese captures go
+# through exactly the modules chosen above; the only thing added to them is the
+# look that tells the two apart (about a tenth of a second).
+#
+# The Japanese OCR cannot read Chinese at all — it answers with Japanese that
+# looks a bit like it — so Chinese needs an OCR of its own. Which language a
+# capture is in is decided by a fast multilingual OCR: Japanese is full of
+# kana, Chinese has none.
+AUTO_DETECT_CHINESE = True
+LANG_PROBE_OCR_MODULE = 'mit48px_ctc'   # fast, rough: only used to tell the language
+CHINESE_OCR_MODULE = 'mit48px'          # slower, accurate: reads the Chinese capture
+CHINESE_SOURCE_LANG = '简体中文'         # what the translator is told the source is
+
 # ── Local-only (not in BT config) ───────────────────────────────────────────
 DEVICE = 'cuda'   # 'cuda' or 'cpu'
 
@@ -135,6 +150,11 @@ def resolve() -> SimpleNamespace:
         inpainter_module=INPAINTER_MODULE or bt.get('inpainter') or _FALLBACK_INPAINTER,
         source_lang=SOURCE_LANG or bt.get('translate_source') or _FALLBACK_SOURCE,
         target_lang=TARGET_LANG or bt.get('translate_target') or _FALLBACK_TARGET,
+
+        auto_detect_chinese=AUTO_DETECT_CHINESE,
+        lang_probe_ocr=LANG_PROBE_OCR_MODULE,
+        chinese_ocr_module=CHINESE_OCR_MODULE,
+        chinese_source_lang=CHINESE_SOURCE_LANG,
 
         device=DEVICE,
         enable_inpaint=ENABLE_INPAINT,
