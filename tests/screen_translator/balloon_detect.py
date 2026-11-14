@@ -40,13 +40,13 @@ def new_page(w=PAGE_W, h=PAGE_H, busy=True, paper=255):
 
 
 def vertical_text(page, box, columns=3, ink=INK):
-    """Fake columns of vertical glyphs inside `box`. Returns the ink bbox."""
+    """Fake columns of vertical glyphs centred in `box`, the way text sits in a
+    balloon or a caption frame. Returns the ink bbox."""
     bx1, by1, bx2, by2 = box
     pad, col_w, gap = 12, 16, 14
-    xs, x = [], bx2 - pad - col_w
-    for _ in range(columns):
-        xs.append(x)
-        x -= col_w + gap
+    total = columns * col_w + (columns - 1) * gap
+    rightmost = (bx1 + bx2 + total) // 2 - col_w
+    xs = [rightmost - i * (col_w + gap) for i in range(columns)]
     y0, y1 = by1 + pad, by2 - pad
     for cx in xs:
         for gy in range(y0, y1 - 14, 22):
@@ -144,6 +144,19 @@ def build_cases():
     page, text = character_sheet()
     miss('flat page background, dark surround', page, text)
 
+    # Same sheet, but the figure reaches the top of the picture and cuts the
+    # background in two. The piece on the list's side is under half the
+    # capture, so size alone does not give it away; the list sitting in its
+    # corner does. (This is the variant that got through first time.)
+    page, text = character_sheet(figure_to_top=True)
+    miss('background split by the figure', page, text)
+
+    # And with the list in the MIDDLE of its piece of background, so position
+    # does not give it away either — but that piece also holds a speech
+    # balloon, and a balloon does not contain another balloon.
+    page, text = character_sheet(figure_to_top=True, balloon_on_list_side=True)
+    miss('background piece holding a balloon', page, text)
+
     # Deliberately conservative: text hard against one side of a much wider
     # frame is NOT taken for that frame's text, because the same geometry is
     # what a background with text in its corner looks like. It falls back to
@@ -177,17 +190,29 @@ def list_rows(page, origin, rows, glyph=18, leading=5, ink=INK):
     return (x0, origin[1], right, y - leading)
 
 
-def character_sheet(margin=20):
+def character_sheet(margin=20, figure_to_top=False, balloon_on_list_side=False):
     """A profile-card page: flat grey ground, a figure rising from the bottom
-    edge, a speech balloon, a list in the top-left corner — inside a dark
-    surround, as when the capture is dragged a little wider than the picture.
-    Returns (page, list text bbox)."""
+    edge, a speech balloon, a list on the left — inside a dark surround, as
+    when the capture is dragged a little wider than the picture.
+
+    `figure_to_top` runs the figure up to the top edge, splitting the ground
+    into a left and a right piece. `balloon_on_list_side` puts the balloon in
+    the left piece and the list in the middle of that piece instead of its
+    corner. Returns (page, list text bbox)."""
     w, h = 720, 500
     page = np.full((h, w, 3), 222, np.uint8)
-    figure = np.array([[300, h], [320, 180], [400, 90], [480, 180], [520, h]], np.int32)
+    if figure_to_top:
+        figure = np.array([[300, h], [320, 0], [480, 0], [520, h]], np.int32)
+    else:
+        figure = np.array([[300, h], [320, 180], [400, 90], [480, 180], [520, h]], np.int32)
     cv2.fillPoly(page, [figure], (60, 60, 70))
-    ellipse(page, (610, 200), (70, 120))
-    text = list_rows(page, (40, 50), [(False, 4), (False, 9), (True, 6), (True, 10), (True, 8)])
+    spec = [(False, 4), (False, 9), (True, 6), (True, 10), (True, 8)]
+    if balloon_on_list_side:
+        ellipse(page, (150, 425), (50, 60))
+        text = list_rows(page, (55, 195), spec)
+    else:
+        ellipse(page, (610, 200), (70, 120))
+        text = list_rows(page, (40, 50), spec)
     page = cv2.copyMakeBorder(page, margin, margin, margin, margin,
                               cv2.BORDER_CONSTANT, value=(30, 30, 30))
     return page, tuple(v + margin for v in text)
@@ -326,13 +351,16 @@ def check_shared_balloon(pipeline_cls):
     rect_frame(page, other_frame)
     other = vertical_text(page, other_frame, 1)
 
-    detect = pipeline_cls._compute_balloon_xyxy
+    # Through _assign_balloons, as the pipeline does: each paragraph on its own
+    # is off-centre in the balloon, and it is the two together that are centred.
     # Detection order deliberately not reading order: left paragraph first.
+    loose = (400, 400, 440, 480)
+    balloons = pipeline_cls._assign_balloons(page, [left, other, right, loose])
     blocks = [
-        TranslatedBlock(left, 0.0, 'L', 'second', detect(page, left)),
-        TranslatedBlock(other, 0.0, 'O', 'elsewhere', detect(page, other)),
-        TranslatedBlock(right, 0.0, 'R', 'first', detect(page, right)),
-        TranslatedBlock((400, 400, 440, 480), 0.0, 'N', 'no balloon', None),
+        TranslatedBlock(left, 0.0, 'L', 'second', balloons[0]),
+        TranslatedBlock(other, 0.0, 'O', 'elsewhere', balloons[1]),
+        TranslatedBlock(right, 0.0, 'R', 'first', balloons[2]),
+        TranslatedBlock(loose, 0.0, 'N', 'no balloon', balloons[3]),
     ]
 
     fails = 0
