@@ -26,6 +26,12 @@ if _ROOT not in sys.path:
 # Force qtpy to pick PyQt6 (BallonsTranslator's default).
 os.environ.setdefault('QT_API', 'pyqt6')
 
+# Has to run before the first Qt import: Qt would otherwise load its own, much
+# older msvcp140.dll, and torch — imported later, with the first capture — then
+# fails to initialise. See utils/msvc_runtime.py.
+from utils.msvc_runtime import preload_system_msvc_runtime
+preload_system_msvc_runtime()
+
 import numpy as np
 from qtpy.QtCore import Qt, QObject, QRect, QThread, Signal
 from qtpy.QtGui import QAction, QGuiApplication, QIcon, QImage, QPixmap

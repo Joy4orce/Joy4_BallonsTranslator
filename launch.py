@@ -12,6 +12,12 @@ import time
 
 TIME_LAUNCH = time.time()
 
+# Before anything can import Qt: Qt would otherwise load its own, much older
+# msvcp140.dll, and torch then fails to initialise when the modules are loaded.
+# See utils/msvc_runtime.py.
+from utils.msvc_runtime import preload_system_msvc_runtime
+preload_system_msvc_runtime()
+
 python = sys.executable
 git = os.environ.get('GIT', "git")
 skip_install = False
