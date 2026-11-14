@@ -347,93 +347,132 @@ class TranslationPipeline:
             ))
         return out, inpainted_img
 
+    # Balloon search tuning. See _compute_balloon_xyxy.
+    _BALLOON_PADS = (1.0, 2.0)       # crop margin, in multiples of the text's long side
+    _BALLOON_TOL = 32                # grey levels a pixel may differ from the paper colour
+    _BALLOON_MAX_AREA_RATIO = 12     # balloon/text bbox area, above which...
+    _BALLOON_MAX_PAGE_SHARE = 0.10   # ...a region this much of the capture is a panel
+    _BALLOON_HARD_AREA_RATIO = 40    # never a balloon, however small on the page
+    _BALLOON_MIN_FILL = 0.4          # paper pixels / balloon bbox area
+
     @staticmethod
     def _compute_balloon_xyxy(img, text_xyxy):
-        """Detect the speech balloon enclosing `text_xyxy` and return its
-        bounding box in image coords, or None if no clean balloon is found.
+        """Find the balloon or caption frame enclosing `text_xyxy` and return
+        its bounding box in image coords, or None if there isn't a clean one.
 
-        Uses BallonsTranslator's classical-CV balloon segmentation
-        (Canny + flood fill), which works on a crop around the text. The crop
-        has to be big enough to hold the WHOLE balloon: the flood fill stops at
-        the crop border just as readily as at an outline, so too small a crop
-        reports a region barely larger than the text and the caller lays the
-        translation out as if there were no balloon at all. A rectangular
-        caption frame holding several vertical lines is much wider than the ink
-        inside it, so a fixed 2x crop reliably cut it off.
+        The balloon is taken to be the connected patch of "paper" the text sits
+        on: every pixel within a tolerance of the background colour between the
+        glyphs, reachable from there without crossing an outline. That makes no
+        assumption about the balloon's shape or how big it is relative to the
+        text, which is the point — it has to handle a wide caption frame around
+        a narrow column of vertical text and a tall thin balloon around a single
+        column equally.
 
-        So try progressively larger crops and only trust a region that is fully
-        enclosed by its crop. Touching a crop edge means the fill was cut off
-        (or leaked across flat background) and the true extent is unknown —
-        unless that edge is the image edge, where touching is real.
+        utils.imgproc_utils.extract_ballon_region is not used here on purpose.
+        It only keeps contours covering at least 40% of the crop it is given, so
+        it works when the crop is a little larger than the balloon and silently
+        finds nothing, or the wrong thing, otherwise; with the balloon's size
+        unknown there is no crop that satisfies it for both shapes above.
 
-        Sanity checks keep a miss from producing a worse layout than the text
-        bbox: the region must be larger than the text bbox and must contain its
-        center.
+        A result is trusted only when its extent is known and plausible:
+          - it must not run into an edge of the search crop (the patch continues
+            beyond what was looked at; retried once with a bigger crop). An
+            edge that is also the image edge is a real boundary and is allowed.
+          - it must not reach three or more image edges — that is the paper
+            colour flooding the whole capture, not a balloon.
+          - it must contain the text's center and be at least the text's size.
+          - it must not be a whole panel: far larger than the text AND a
+            sizeable share of the capture. Size relative to the text alone is
+            not enough to tell — a lone "!" in a big balloon is as lopsided as
+            narration loose in a panel, but the balloon is small on the page.
+          - it must be reasonably solid rather than a thin leak along gutters.
+        Any miss returns None and the caller falls back to the text bbox, so a
+        miss never produces a worse layout than no detection at all.
         """
         try:
-            from utils.imgproc_utils import extract_ballon_region
+            import cv2
 
+            ih, iw = img.shape[:2]
             x1, y1, x2, y2 = [int(v) for v in text_xyxy]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(iw, x2), min(ih, y2)
             tw, th = x2 - x1, y2 - y1
             if tw < 2 or th < 2:
                 return None
-            ih, iw = img.shape[:2]
             tcx, tcy = (x1 + x2) / 2, (y1 + y2) / 2
 
-            # extract_ballon_region shapes its crop to the aspect ratio of the
-            # rect it is given, so a tall narrow column of vertical text yields
-            # a tall narrow crop that cannot contain a wide balloon no matter
-            # how much it is enlarged. Probe with a square rect on the same
-            # center instead; only the crop geometry and the fill seed come from
-            # it, and the seed stays inside the balloon either way.
-            side = max(tw, th)
-            probe = [int(tcx - side / 2), int(tcy - side / 2), side, side]
+            def grey(a):
+                return a if a.ndim == 2 else cv2.cvtColor(a, cv2.COLOR_RGB2GRAY)
 
-            for enlarge_ratio in (2.0, 3.0, 4.5):
-                # extract_ballon_region takes [x, y, w, h] and returns
-                # (mask, area, [cx1,cy1,cx2,cy2] enlarged-crop-in-image-coords,
-                #  (lx,ly,lw,lh) balloon-bbox-within-crop, crop-scale undone).
-                result = extract_ballon_region(
-                    img, probe,
-                    enlarge_ratio=enlarge_ratio, cal_region_rect=True,
-                )
-                if len(result) < 4:
-                    continue
-                _mask, _area, crop_rect, local_rect = result
-                cx1, cy1, cx2, cy2 = crop_rect
-                lx, ly, lw, lh = local_rect
-                if lw <= 0 or lh <= 0:
-                    continue
+            # Paper colour: the most common grey level in a thin ring just
+            # outside the text bbox. Text never touches its outline, so that
+            # ring is almost all paper, whichever way round the polarity is.
+            # (Sampling inside the bbox instead picks the INK colour for a
+            # dense bold column, where ink is the majority of the box.)
+            ring = max(2, min(tw, th) // 6)
+            rx1, ry1 = max(0, x1 - ring), max(0, y1 - ring)
+            rx2, ry2 = min(iw, x2 + ring), min(ih, y2 + ring)
+            around = grey(img[ry1:ry2, rx1:rx2])
+            outside = np.ones(around.shape, bool)
+            outside[y1 - ry1:y2 - ry1, x1 - rx1:x2 - rx1] = False
+            samples = around[outside] if outside.any() else around.ravel()
+            hist = np.bincount((samples >> 3).ravel(), minlength=32)
+            paper_level = int(hist.argmax()) * 8 + 4
 
-                crop_w = max(1, cx2 - cx1)
-                crop_h = max(1, cy2 - cy1)
+            cls = TranslationPipeline
+            prev_crop = None
+            for pad_mul in cls._BALLOON_PADS:
+                pad = int(max(tw, th) * pad_mul)
+                cx1, cy1 = max(0, x1 - pad), max(0, y1 - pad)
+                cx2, cy2 = min(iw, x2 + pad), min(ih, y2 + pad)
+                if (cx1, cy1, cx2, cy2) == prev_crop:
+                    break       # already bounded by the image; nothing new to see
+                prev_crop = (cx1, cy1, cx2, cy2)
+                crop_w, crop_h = cx2 - cx1, cy2 - cy1
 
-                bx1 = cx1 + lx
-                by1 = cy1 + ly
-                bx2 = bx1 + lw
-                by2 = by1 + lh
+                crop = grey(img[cy1:cy2, cx1:cx2]).astype(np.int16)
+                paper = (np.abs(crop - paper_level) <= cls._BALLOON_TOL).astype(np.uint8)
+                # 4-connectivity: a one-pixel diagonal outline still separates.
+                n, labels, stats, _ = cv2.connectedComponentsWithStats(
+                    paper, connectivity=4)
+                if n < 2:
+                    return None
 
-                if lw * lh < tw * th:
-                    continue
+                # The paper patch that owns most of the text bbox and its
+                # ring. Counters enclosed by glyphs are separate, much smaller
+                # components.
+                inside = labels[ry1 - cy1:ry2 - cy1, rx1 - cx1:rx2 - cx1]
+                owned = np.bincount(inside.ravel(), minlength=n)
+                owned[0] = 0
+                label = int(owned.argmax())
+                if owned[label] == 0:
+                    return None
+                lx, ly, lw, lh, area = (int(v) for v in stats[label])
+
+                at_l, at_t = lx == 0, ly == 0
+                at_r, at_b = lx + lw == crop_w, ly + lh == crop_h
+                cut_off = ((at_l and cx1 > 0) or (at_t and cy1 > 0)
+                           or (at_r and cx2 < iw) or (at_b and cy2 < ih))
+                if cut_off:
+                    continue    # extent unknown at this crop size
+
+                # Extent is real from here on, so a failed check is final.
+                if at_l + at_t + at_r + at_b >= 3:
+                    return None
+                bx1, by1 = cx1 + lx, cy1 + ly
+                bx2, by2 = bx1 + lw, by1 + lh
                 if not (bx1 <= tcx <= bx2 and by1 <= tcy <= by2):
-                    continue
-
-                # Enclosed check. An edge of the crop that is also an edge of
-                # the image is a real boundary, so touching it is allowed.
-                m = 2
-                clipped = (
-                    (lx <= m and cx1 > 0)
-                    or (ly <= m and cy1 > 0)
-                    or (lx + lw >= crop_w - m and cx2 < iw)
-                    or (ly + lh >= crop_h - m and cy2 < ih)
-                )
-                if clipped:
-                    continue
-
-                bx1 = max(0, int(bx1)); by1 = max(0, int(by1))
-                bx2 = min(iw, int(bx2)); by2 = min(ih, int(by2))
-                if bx2 - bx1 < 2 or by2 - by1 < 2:
-                    continue
+                    return None
+                if lw * lh < tw * th:
+                    return None
+                area_ratio = (lw * lh) / (tw * th)
+                if area_ratio > cls._BALLOON_HARD_AREA_RATIO:
+                    return None
+                if (area_ratio > cls._BALLOON_MAX_AREA_RATIO
+                        and lw * lh > cls._BALLOON_MAX_PAGE_SHARE * iw * ih):
+                    return None
+                if area < cls._BALLOON_MIN_FILL * lw * lh:
+                    return None
                 return (bx1, by1, bx2, by2)
 
             return None

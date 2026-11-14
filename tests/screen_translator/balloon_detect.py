@@ -1,20 +1,15 @@
 """Balloon detection for the screen translator, on synthetic pages.
 
 The overlay lays a translation out to fill the balloon it was given; when
-detection misses, it falls back to the narrow OCR text bbox and the result reads
-as misaligned with the frame it belongs to. These cases cover the shapes that
-actually appear in the comics this tool gets pointed at.
+detection misses, it falls back to the narrow OCR text bbox, and when detection
+is wrong the text lands somewhere it does not belong. These cases cover the
+shapes that actually appear in the comics this tool gets pointed at, and the
+ways an earlier version of the detector got them wrong.
 
-Assertions are on properties rather than exact pixel counts, so the test stays
-meaningful when the segmentation is tuned:
-
-  - a rectangular caption frame must be recovered nearly in full (the reported
-    bug: a tall column of vertical text yielded a crop too narrow to contain the
-    frame, so only a sliver around the ink came back)
-  - the same frame flush against the panel edge must still be recovered
-  - a round balloon must at least be found and be clearly larger than the ink
-  - text on flat background with no enclosing shape must return None, rather
-    than a bogus region invented by a flood fill that ran to the crop border
+A hit is checked against the true outline on every side (within TOL pixels), not
+just for being "big enough" — a region truncated on one side passes any area
+test and still centers the text in the wrong place. Cases that must not produce
+a balloon are checked for None.
 
 Run: python tests/screen_translator/balloon_detect.py
 """
@@ -29,75 +24,118 @@ APP_ROOT = osp.dirname(osp.dirname(osp.dirname(osp.abspath(__file__))))
 sys.path.append(APP_ROOT)
 
 PAGE_W, PAGE_H = 724, 1288      # a real capture size from the screen translator
+TOL = 6                         # px a detected edge may sit from the true outline
+INK = (20, 20, 20)
 
 
-def new_page():
-    """White page with busy artwork, so crops are never trivially flat."""
-    page = np.full((PAGE_H, PAGE_W, 3), 255, np.uint8)
-    rng = np.random.default_rng(1)
-    page[600:, :] = rng.integers(120, 250, (PAGE_H - 600, PAGE_W, 3),
-                                 dtype=np.uint8)
-    for x in range(0, PAGE_W, 17):
-        cv2.line(page, (x, 300), (x + 60, 590), (60, 60, 60), 1)
+def new_page(w=PAGE_W, h=PAGE_H, busy=True, paper=255):
+    """A page with busy artwork, so crops are never trivially flat."""
+    page = np.full((h, w, 3), paper, np.uint8)
+    if busy:
+        rng = np.random.default_rng(1)
+        page[h // 2:, :] = rng.integers(120, 250, (h - h // 2, w, 3), dtype=np.uint8)
+        for x in range(0, w, 17):
+            cv2.line(page, (x, h // 4), (x + 60, h // 2 - 10), (60, 60, 60), 1)
     return page
 
 
-def draw_vertical_text(page, frame, columns=3):
-    """Fake columns of vertical glyphs inside `frame`. Returns the ink bbox."""
-    fx1, fy1, fx2, fy2 = frame
+def vertical_text(page, box, columns=3, ink=INK):
+    """Fake columns of vertical glyphs inside `box`. Returns the ink bbox."""
+    bx1, by1, bx2, by2 = box
     pad, col_w, gap = 12, 16, 14
-    xs, x = [], fx2 - pad - col_w
+    xs, x = [], bx2 - pad - col_w
     for _ in range(columns):
         xs.append(x)
         x -= col_w + gap
-    y0, y1 = fy1 + pad, fy2 - pad
+    y0, y1 = by1 + pad, by2 - pad
     for cx in xs:
         for gy in range(y0, y1 - 14, 22):
-            cv2.rectangle(page, (cx, gy), (cx + col_w, gy + 14), (20, 20, 20), -1)
+            cv2.rectangle(page, (cx, gy), (cx + col_w, gy + 14), ink, -1)
     return (min(xs), y0, max(xs) + col_w, y1)
 
 
-def rect_frame(page, frame):
-    cv2.rectangle(page, frame[:2], frame[2:], (255, 255, 255), -1)
-    cv2.rectangle(page, frame[:2], frame[2:], (0, 0, 0), 2)
+def rect_frame(page, frame, fill=(255, 255, 255), line=(0, 0, 0)):
+    cv2.rectangle(page, frame[:2], frame[2:], fill, -1)
+    cv2.rectangle(page, frame[:2], frame[2:], line, 2)
+
+
+def ellipse(page, center, axes, fill=(255, 255, 255), line=(0, 0, 0)):
+    cv2.ellipse(page, center, axes, 0, 0, 360, fill, -1)
+    cv2.ellipse(page, center, axes, 0, 0, 360, line, 2)
+    cx, cy = center
+    ax, ay = axes
+    return (cx - ax, cy - ay, cx + ax, cy + ay)
 
 
 def build_cases():
     cases = []
 
+    def hit(name, page, text, outline):
+        cases.append(dict(name=name, page=page, text=text, outline=outline))
+
+    def miss(name, page, text):
+        cases.append(dict(name=name, page=page, text=text, outline=None))
+
+    # --- shapes that must be recovered, edge for edge -------------------
     page = new_page()
     frame = (60, 90, 260, 400)
     rect_frame(page, frame)
-    cases.append(dict(
-        name='rect caption frame, vertical text',
-        page=page, text=draw_vertical_text(page, frame, 4),
-        want='cover', frame=frame, min_cover=0.85,
-    ))
+    hit('rect caption frame, vertical text', page,
+        vertical_text(page, frame, 4), frame)
 
     page = new_page()
     frame = (0, 90, 200, 380)
     rect_frame(page, frame)
-    cases.append(dict(
-        name='rect caption frame at panel edge',
-        page=page, text=draw_vertical_text(page, frame, 3),
-        want='cover', frame=frame, min_cover=0.85,
-    ))
+    hit('rect caption frame at page edge', page,
+        vertical_text(page, frame, 3), frame)
+
+    # A wide frame around ONE narrow column — the shape a crop sized from the
+    # text's own aspect ratio can never contain.
+    page = new_page()
+    frame = (300, 80, 560, 420)
+    rect_frame(page, frame)
+    hit('wide frame, single narrow column', page,
+        vertical_text(page, (500, 80, 560, 420), 1), frame)
 
     page = new_page()
-    cv2.ellipse(page, (500, 200), (110, 80), 0, 0, 360, (255, 255, 255), -1)
-    cv2.ellipse(page, (500, 200), (110, 80), 0, 0, 360, (0, 0, 0), 2)
-    cases.append(dict(
-        name='round speech balloon',
-        page=page, text=draw_vertical_text(page, (420, 140, 570, 260), 2),
-        want='bigger_than_text', min_area_ratio=1.5,
-    ))
+    outline = ellipse(page, (500, 200), (110, 80))
+    hit('round speech balloon over artwork', page,
+        vertical_text(page, (420, 140, 570, 260), 2), outline)
+
+    # Tall thin balloon, one column, nothing else around: its bbox is a small
+    # share of any generous crop.
+    page = new_page(700, 900, busy=False)
+    outline = ellipse(page, (350, 400), (45, 190))
+    hit('isolated tall balloon, one column', page,
+        vertical_text(page, (322, 250, 378, 550), 1), outline)
 
     page = new_page()
-    cases.append(dict(
-        name='no enclosing shape, text on background',
-        page=page, text=draw_vertical_text(page, (300, 700, 460, 980), 3),
-        want='none',
-    ))
+    outline = ellipse(page, (360, 220), (120, 90), fill=(200, 200, 200))
+    hit('grey-filled balloon', page,
+        vertical_text(page, (290, 160, 430, 280), 2), outline)
+
+    page = new_page()
+    frame = (80, 100, 300, 380)
+    rect_frame(page, frame, fill=(25, 25, 25), line=(255, 255, 255))
+    hit('dark frame, light text', page,
+        vertical_text(page, frame, 3, ink=(235, 235, 235)), frame)
+
+    # --- situations that must NOT produce a balloon ----------------------
+    page = new_page()
+    miss('text straight on artwork, no shape', page,
+         vertical_text(page, (300, 700, 460, 980), 3))
+
+    # Small capture of borderless text: the paper colour floods the whole image.
+    page = new_page(260, 100, busy=False, paper=235)
+    cv2.putText(page, 'HELLO WORLD', (34, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.9, INK, 2)
+    miss('small flat capture, borderless text', page, (30, 36, 230, 64))
+
+    # Narration sitting directly in a big empty panel: the enclosed region is
+    # the panel, not a balloon.
+    page = new_page(busy=False)
+    cv2.rectangle(page, (40, 100), (680, 900), (0, 0, 0), 3)
+    miss('text loose inside a large panel', page,
+         vertical_text(page, (330, 400, 390, 620), 1))
 
     return cases
 
@@ -108,31 +146,20 @@ def main():
 
     failures = 0
     for case in build_cases():
-        text = case['text']
-        got = detect(case['page'], text)
-        tw, th = text[2] - text[0], text[3] - text[1]
-        want = case['want']
+        got = detect(case['page'], case['text'])
+        outline = case['outline']
 
-        if want == 'none':
+        if outline is None:
             ok = got is None
             detail = 'None as required' if ok else f'invented {got}'
         elif got is None:
             ok = False
             detail = 'no balloon found; would fall back to the text bbox'
-        elif want == 'cover':
-            fx1, fy1, fx2, fy2 = case['frame']
-            fw, fh = fx2 - fx1, fy2 - fy1
-            gw, gh = got[2] - got[0], got[3] - got[1]
-            cover_w, cover_h = gw / fw, gh / fh
-            ok = cover_w >= case['min_cover'] and cover_h >= case['min_cover']
-            detail = (f'{gw}x{gh} of frame {fw}x{fh} '
-                      f'({cover_w:.0%} x {cover_h:.0%} covered)')
-        else:   # bigger_than_text
-            gw, gh = got[2] - got[0], got[3] - got[1]
-            ratio = (gw * gh) / max(1, tw * th)
-            ok = ratio >= case['min_area_ratio']
-            detail = (f'{gw}x{gh}, {ratio:.1f}x the ink area '
-                      f'(need {case["min_area_ratio"]}x)')
+        else:
+            off = [g - o for g, o in zip(got, outline)]
+            ok = all(abs(d) <= TOL for d in off)
+            detail = (f'{got} vs outline {outline}, '
+                      f'edge offsets L{off[0]:+d} T{off[1]:+d} R{off[2]:+d} B{off[3]:+d}')
 
         failures += 0 if ok else 1
         print(f'{"PASS" if ok else "FAIL"}  {case["name"]:36} {detail}')
