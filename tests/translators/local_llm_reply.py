@@ -75,5 +75,21 @@ t = Fake(['I cannot do that.'] * 2)
 got = t._translate(['あ'])
 expect('single entry failure is empty', got == [''], str(got))
 
+# A Chinese source gets the Chinese prompt; a Japanese one keeps the user's.
+t = Fake([])
+t.params['system prompt'] = {'type': 'editor', 'content': 'JAPANESE RULES'}
+ja_prompt = t._build_system_prompt(2)
+t.lang_source = '简体中文'
+t.lang_map['简体中文'] = 'Simplified Chinese'
+zh_prompt = t._build_system_prompt(2)
+expect('japanese source keeps its own prompt',
+       ja_prompt.startswith('JAPANESE RULES') and 'Source language: Japanese' in ja_prompt)
+expect('chinese source gets the chinese prompt',
+       'JAPANESE RULES' not in zh_prompt and 'Chinese-to-Korean' in zh_prompt
+       and 'Source language: Simplified Chinese' in zh_prompt)
+t.params['system prompt (Chinese source)'] = {'type': 'editor', 'content': ''}
+expect('emptied, it falls back to the main prompt',
+       t._build_system_prompt(2).startswith('JAPANESE RULES'))
+
 print('all passed' if not fails else f'{fails} failed')
 sys.exit(1 if fails else 0)
