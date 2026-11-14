@@ -21,10 +21,24 @@ from .base import BaseTranslator, register_translator
 
 
 _DEFAULT_SYSTEM_PROMPT = (
-    "You are a professional manga / comic translator. "
-    "Translate each entry of the input JSON array into the target language. "
-    "Preserve the original tone, register, and any onomatopoeia / interjection "
-    "style. Do not censor or paraphrase beyond what natural translation requires."
+    "You are a professional Japanese-to-Korean translator for manga, webtoons, and "
+    "Japanese web images. Produce natural, idiomatic Korean that reads fluently to a "
+    "native speaker, never stiff or word-for-word. Match each speaker's tone and register "
+    "(casual, rough, cute, polite, archaic) and keep lines short and punchy like real "
+    "speech-bubble text. Render onomatopoeia and sound effects as natural Korean "
+    "equivalents instead of transliterating them. Adapt Japanese honorifics and name "
+    "suffixes (-san, -chan, -kun, -senpai) to natural Korean usage that fits the "
+    "relationship. Preserve emotional nuance, emphasis, and interjections. Do not censor, "
+    "tone down, or add explanations; translate crude or adult language faithfully. "
+    "Translate every word into Korean, including shouts, interjections, and swearing "
+    "(for example おい to 야 or 어이, くそ to 젠장 or 제기랄); never leave any Japanese text "
+    "untranslated and never write it in romaji. "
+    "For personal names, transliterate by their Japanese reading (e.g. 木島 to 키지마, "
+    "智美 to 사토미), never by the literal meaning of the characters. For Japanese "
+    "abbreviations and net-slang, output the real Korean meaning, not a phonetic spelling "
+    "(e.g. パワハラ to 갑질, セクハラ to 성희롱, 彼氏 to 남친, キツい to 까칠하다 or 드세다). "
+    "Keep each line and each bullet marker on its own line exactly as in the source; "
+    "never merge or reflow lines."
 )
 
 
@@ -175,10 +189,10 @@ class LocalLLMTranslator(BaseTranslator):
             'type': 'editor',
             'content': _DEFAULT_SYSTEM_PROMPT,
         },
-        'temperature': 0.4,
+        'temperature': 0.3,
         'max tokens': 4096,
-        'repeat penalty': 1.1,
-        'frequency penalty': 0.5,
+        'repeat penalty': 1.05,
+        'frequency penalty': 0.2,
         'timeout': 300,
         'retry attempts': 2,
         'merge system into user': True,
@@ -244,13 +258,13 @@ class LocalLLMTranslator(BaseTranslator):
         model = (self.params.get('model') or 'local').strip() or 'local'
 
         try:
-            repeat_penalty = float(self.params.get('repeat penalty', 1.1))
+            repeat_penalty = float(self.params.get('repeat penalty', 1.05))
         except (TypeError, ValueError):
-            repeat_penalty = 1.1
+            repeat_penalty = 1.05
         try:
-            frequency_penalty = float(self.params.get('frequency penalty', 0.5))
+            frequency_penalty = float(self.params.get('frequency penalty', 0.2))
         except (TypeError, ValueError):
-            frequency_penalty = 0.5
+            frequency_penalty = 0.2
 
         merge_system = bool(self.params.get('merge system into user', True))
         if merge_system:
@@ -297,9 +311,9 @@ class LocalLLMTranslator(BaseTranslator):
             return []
 
         try:
-            temperature = float(self.params.get('temperature', 0.4))
+            temperature = float(self.params.get('temperature', 0.3))
         except (TypeError, ValueError):
-            temperature = 0.4
+            temperature = 0.3
         try:
             max_tokens = int(self.params.get('max tokens', 4096))
         except (TypeError, ValueError):
