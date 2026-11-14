@@ -17,9 +17,13 @@ _TORCH_DLL_DIR_ADDED = False
 def _ensure_torch_dll_dir():
     """Add PyTorch's bundled CUDA/cuDNN DLLs to the search path so ORT can find them.
 
-    ORT-GPU 1.17.x on Windows needs CUDA 11.8 + cuDNN 8.x DLLs. The portable
-    BallonsTranslator distribution doesn't ship a system-wide CUDA install,
-    but the bundled PyTorch (cu118 build) carries them under torch/lib.
+    ORT-GPU on Windows ships no CUDA runtime of its own, and the portable
+    BallonsTranslator distribution has no system-wide CUDA install, so ORT
+    loads the CUDA/cuDNN DLLs that the bundled PyTorch carries under torch/lib.
+    That ties the two together: ORT must be a build for the same CUDA
+    generation as the installed torch (currently cu128 torch, CUDA 12.8 +
+    cuDNN 9, with onnxruntime-gpu >= 1.22). A mismatch does not raise — ORT
+    just fails to create the CUDA provider and runs on CPU.
     Calling os.add_dll_directory once is enough — it persists per-process.
     """
     global _TORCH_DLL_DIR_ADDED
@@ -71,8 +75,8 @@ class MangaOcr2025:
     Same input/output as the original MangaOcr (numpy RGB image -> Japanese
     text string), but inference goes through ORT instead of PyTorch.
 
-    device='cuda' uses CUDAExecutionProvider (PyTorch's bundled CUDA 11.8 +
-    cuDNN 8 satisfy the runtime via _ensure_torch_dll_dir). device='cpu'
+    device='cuda' uses CUDAExecutionProvider (PyTorch's bundled CUDA and
+    cuDNN DLLs satisfy the runtime via _ensure_torch_dll_dir). device='cpu'
     uses CPUExecutionProvider — still under 1s per balloon on this size.
     """
 
